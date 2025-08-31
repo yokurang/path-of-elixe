@@ -1,13 +1,22 @@
 import asyncio
 import json
 import logging
-import os
 import random
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any, Dict, List, Optional, Tuple
+
+from main import setup_logging
+
+from src.data.market_currency_listener import (
+    get_currency_cache,
+    get_rate as get_fx_rate,
+    Server,
+)
+
+from src.data.constants import TRADE_API_CURRENCY_NAMES_TO_AOEAH_CURRENCY_NAMES
 
 import aiohttp
 import pandas as pd
@@ -68,122 +77,98 @@ log_search.addHandler(logging.NullHandler())
 log_fetch = logging.getLogger("poe.trade")
 log_fetch.addHandler(logging.NullHandler())
 
+# price conversion class
 
-def setup_logging(level: str = "INFO") -> str:
+class PriceConverter:
     """
-    Initialize logging to console + logs/log_<YYYY-MM-DD-HH-MM>.txt.
-    Returns the path to the log file.
+    Converts listing prices to a base currency using the cached currency matrix.
+    Applies a single .get() mapping from Trade API codes/labels to AOEAH canonical names.
     """
-    os.makedirs("logs", exist_ok=True)
-    log_path = datetime.now().strftime("logs/log_%Y-%m-%d-%H-%M.txt")
-
-    # If logging already configured, don't reconfigure; just add a file handler.
-    root = logging.getLogger()
-    has_handlers = bool(root.handlers)
-
-    lvl = getattr(logging, level.upper(), logging.INFO)
-    if not has_handlers:
-        logging.basicConfig(
-            level=lvl,
-            format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-            datefmt="%H:%M:%S",
-            handlers=[
-                logging.StreamHandler(),
-                logging.FileHandler(log_path, encoding="utf-8")
-            ],
+    def __init__(self, cache, server: Server, base_currency: str):
+        self.cache = cache
+        self.server = server
+        # Apply the same mapping to base currency (in case someone passes "ex" etc.)
+        self.base_currency = TRADE_API_CURRENCY_NAMES_TO_AOEAH_CURRENCY_NAMES.get(
+            str(base_currency).strip().lower(),
+            base_currency,
         )
-    else:
-        # Ensure our file handler exists
-        fh = logging.FileHandler(log_path, encoding="utf-8")
-        fh.setLevel(lvl)
-        fmt = logging.Formatter(
-            "%(asctime)s | %(levelname)s | %(name)s | %(message)s", "%H:%M:%S")
-        fh.setFormatter(fmt)
-        root.addHandler(fh)
-        root.setLevel(lvl)
 
-    logging.info("Logging initialized; file=%s", log_path)
-    return log_path
+    def convert(self, amount: Optional[float], currency: Optional[str]) -> Tuple[Optional[float], Optional[float]]:
+        """
+        Returns (amount_in_base, rate_to_base). If conversion fails, both are None.
+        """
+        if amount is None or not currency:
+            raise ValueError(f"PriceConverter.convert failed; amount={amount}, currency={currency}")
 
+        src = TRADE_API_CURRENCY_NAMES_TO_AOEAH_CURRENCY_NAMES.get(str(currency).strip().lower(), currency)
+        dst = self.base_currency
+
+        if src == dst:
+            return amount, 1.0
+
+        rate = get_fx_rate(self.cache, self.server, src, dst)
+        if rate and rate > 0:
+            converted = amount * rate
+            log_fetch.debug("FX convert: %.6f %s -> %.6f %s (rate=%.6f, server=%s)",
+                            amount, src, converted, dst, rate, self.server.value)
+            return converted, rate
+
+        log_fetch.debug("FX missing: cannot convert %s -> %s (server=%s)", src, dst, self.server.value)
+        raise ValueError("FX missing: cannot convert %s -> %s (server=%s)", src, dst, self.server.value)
 
 # helper functions
 def build_search_url(*, realm: str, league: str) -> str:
     from urllib.parse import quote
     return TRADE2_SEARCH_URL.format(realm=realm, league=quote(league, safe=""))
 
-
 def referer_for(*, realm: str, league: str) -> str:
     from urllib.parse import quote
     return f"https://www.pathofexile.com/trade2/search/{realm}/{quote(league, safe='')}"
 
-
 def _retry_after_seconds(resp: aiohttp.ClientResponse) -> Optional[float]:
-    """
-    Parse Retry-After seconds or HTTP-date; fallback to X-RateLimit-Reset (epoch).
-    """
     ra_raw = resp.headers.get("Retry-After")
     if ra_raw:
         s = ra_raw.strip()
-        # numeric seconds?
         try:
             return max(0.0, float(s))
         except Exception:
             pass
-        # HTTP-date?
         try:
             dt = parsedate_to_datetime(s)
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
             return max(0.0, (dt - datetime.now(timezone.utc)).total_seconds())
-        except Exception:
-            pass
-
-    # fallback epoch
+        except Exception as e:
+            raise ValueError(f"_retry_after_seconds failed: {e}")
     x_reset = resp.headers.get("X-RateLimit-Reset")
     if x_reset:
         try:
             reset_ts = float(x_reset)
             now_ts = datetime.now(timezone.utc).timestamp()
             return max(0.0, reset_ts - now_ts)
-        except Exception:
-            pass
+        except Exception as e:
+            raise ValueError(f"_retry_after_seconds failed: {e}")
     return None
 
-
 def _expo_backoff(attempt: int, base: float = 0.5, cap: float = 12.0) -> float:
-    """Exponential backoff with ±15% jitter."""
-    raw = min(cap, base * (2**(attempt - 1)))
+    raw = min(cap, base * (2 ** (attempt - 1)))
     return max(0.0, raw * (1.0 + random.uniform(-0.15, 0.15)))
-
-
-def _mask_secret(val: Optional[str]) -> Optional[str]:
-    if not val or not isinstance(val, str):
-        return val
-    if len(val) <= 6:
-        return "***"
-    return f"{val[:3]}…{val[-3:]}"
-
 
 def _masked_cfg_for_log(cfg: Dict[str, Any]) -> Dict[str, Any]:
     out = dict(cfg)
     if "poe_sessid" in out:
-        out["poe_sessid"] = _mask_secret(out["poe_sessid"])
+        out["poe_sessid"] = out["poe_sessid"]
     if "cf_clearance" in out:
-        out["cf_clearance"] = _mask_secret(out["cf_clearance"])
+        out["cf_clearance"] = out["cf_clearance"]
     return out
 
-
-# get configs from yaml
+# load configs from yaml file
 def load_config(path: str = CONFIG_PATH) -> Dict[str, Any]:
     log_search.info("Loading config from %s", path)
     with open(path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
-    log_search.info(
-        "Config loaded (masked): %s",
-        json.dumps(_masked_cfg_for_log(cfg), ensure_ascii=False,
-                   sort_keys=True))
+    log_search.info("Config loaded (masked): %s", json.dumps(_masked_cfg_for_log(cfg), ensure_ascii=False, sort_keys=True))
     return cfg
-
 
 def headers_from_config(cfg: Dict[str, Any]) -> Dict[str, str]:
     log_search.info("Building headers from config (cookies masked in logs)")
@@ -196,51 +181,42 @@ def headers_from_config(cfg: Dict[str, Any]) -> Dict[str, str]:
     if cookie_parts:
         h["Cookie"] = "; ".join(cookie_parts)
         log_search.info("Cookie present: POESESSID=%s, cf_clearance=%s",
-                        _mask_secret(cfg.get("poe_sessid")),
-                        _mask_secret(cfg.get("cf_clearance")))
+                        cfg.get("poe_sessid"),
+                        cfg.get("cf_clearance"))
     else:
         log_search.info("No Cookie set (anonymous/unauthenticated)")
     return h
-
 
 def payload_from_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
     log_search.info("Constructing search payload from config")
     status_obj = cfg.get("status", {"option": "online"})
     if isinstance(status_obj, str):
         status_obj = {"option": status_obj}
-    stats_list = cfg.get("stats") or [{
-        "type": "and",
-        "filters": [],
-        "disabled": False
-    }]
-    filters_obj = cfg.get("filters") or {
-        "type_filters": {
-            "filters": {},
-            "disabled": False
-        }
-    }
+    stats_list = cfg.get("stats") or [{"type": "and", "filters": [], "disabled": False}]
+    filters_obj = cfg.get("filters") or {"type_filters": {"filters": {}, "disabled": False}}
     if "type_filters" not in filters_obj:
         filters_obj = {"type_filters": {"filters": {}, "disabled": False}}
     sort_obj = cfg.get("sort") or {"price": "asc"}
 
-    payload = {
-        "query": {
-            "status": status_obj,
-            "stats": stats_list,
-            "filters": filters_obj
-        },
-        "sort": sort_obj
-    }
+    payload = {"query": {"status": status_obj, "stats": stats_list, "filters": filters_obj}, "sort": sort_obj}
     q = payload["query"]
-    log_search.info(
-        "Payload summary: status=%s sort=%s stats_blocks=%d has_type_filters=%s",
-        q.get("status"),
-        payload.get("sort"),
-        len(q.get("stats") or []),
-        "type_filters" in (q.get("filters") or {}),
-    )
+    log_search.info("Payload summary: status=%s sort=%s stats_blocks=%d has_type_filters=%s",
+                    q.get("status"), payload.get("sort"), len(q.get("stats") or []),
+                    "type_filters" in (q.get("filters") or {}))
     return payload
 
+def _parse_server(name: Optional[str]) -> Server:
+    if not name:
+        return Server.STANDARD
+
+    for s in Server:
+        if name == s.value:
+            return s
+
+    raise ValueError(
+        f"Unknown server {name!r}. Valid values: "
+        + ", ".join(repr(s.value) for s in Server)
+    )
 
 def options_from_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
     opts = {
@@ -249,13 +225,14 @@ def options_from_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "timeout": cfg.get("timeout", 30),
         "max_retries": cfg.get("max_retries", 5),
         "post_request_pause": float(cfg.get("post_request_pause", 1.0)),
+        # base currency + server for conversion
+        "base_currency": cfg.get("base_currency", "Exalted Orb"),
+        # Keep Server.STANDARD exactly "Standard" so it matches Trade search
+        "base_server": _parse_server(cfg.get("base_server", "Standard")),
     }
-    log_search.info("Resolved options: %s",
-                    json.dumps(opts, ensure_ascii=False, sort_keys=True))
+    log_search.info("Resolved options: %s", json.dumps({**opts, "base_server": opts["base_server"].value}, ensure_ascii=False, sort_keys=True))
     return opts
 
-
-# data types for poe trade queries and responses
 @dataclass(frozen=True)
 class Trade2SearchOutcome:
     ok: bool
@@ -266,7 +243,6 @@ class Trade2SearchOutcome:
     truncated: bool
     message: Optional[str]
 
-
 def _process_search_json(data: Dict[str, Any]) -> Trade2SearchOutcome:
     log_search.debug("Processing search JSON")
     if isinstance(data, dict) and "error" in data:
@@ -274,8 +250,7 @@ def _process_search_json(data: Dict[str, Any]) -> Trade2SearchOutcome:
         msg = err.get("message") if isinstance(err, dict) else None
         if msg and "complex" in str(msg).lower():
             log_search.error("Query rejected as too complex: %s", msg)
-        return Trade2SearchOutcome(False, None, [], None, None, False,
-                                   str(msg) if msg is not None else None)
+        return Trade2SearchOutcome(False, None, [], None, None, False, str(msg) if msg is not None else None)
 
     search_id = data.get("id")
     ids = data.get("result", []) or []
@@ -283,15 +258,10 @@ def _process_search_json(data: Dict[str, Any]) -> Trade2SearchOutcome:
     complexity = data.get("complexity")
     truncated = bool(total is not None and total >= 10_000)
     if truncated:
-        log_search.warning(
-            "Search returned >=10,000 matches (truncated); consider narrowing filters"
-        )
-    log_search.info(
-        "Parsed search outcome: search_id=%s ids=%d total=%s complexity=%s truncated=%s",
-        search_id, len(ids), total, complexity, truncated)
-    return Trade2SearchOutcome(True, search_id, ids, total, complexity,
-                               truncated, None)
-
+        log_search.warning("Search returned >=10,000 matches (truncated); consider narrowing filters")
+    log_search.info("Parsed search outcome: search_id=%s ids=%d total=%s complexity=%s truncated=%s",
+                    search_id, len(ids), total, complexity, truncated)
+    return Trade2SearchOutcome(True, search_id, ids, total, complexity, truncated, None)
 
 async def post_trade2_search(
     session: aiohttp.ClientSession,
@@ -303,58 +273,45 @@ async def post_trade2_search(
     max_retries: int,
     post_request_pause: float,
 ) -> Trade2SearchOutcome:
-    """POST /api/trade2/search with respectful retries and detailed logs."""
     attempt = 0
     consec_429 = 0
     while True:
         attempt += 1
         log_search.info("POST %s (attempt %d)", url, attempt)
-        log_search.debug("Request payload: %s",
-                         json.dumps(payload, ensure_ascii=False))
-        resp = await session.post(url,
-                                  json=payload,
-                                  headers=headers,
-                                  timeout=timeout)
+        log_search.debug("Request payload: %s", json.dumps(payload, ensure_ascii=False))
+        resp = await session.post(url, json=payload, headers=headers, timeout=timeout)
         async with resp:
             rate_rem = resp.headers.get("X-RateLimit-Remaining")
             rate_used = resp.headers.get("X-RateLimit-Used")
-            log_search.info(
-                "HTTP status=%s, X-RateLimit-Remaining=%s, X-RateLimit-Used=%s",
-                resp.status, rate_rem, rate_used)
+            log_search.info("HTTP status=%s, X-RateLimit-Remaining=%s, X-RateLimit-Used=%s",
+                            resp.status, rate_rem, rate_used)
             try:
                 resp.raise_for_status()
             except aiohttp.ClientResponseError:
-                if resp.status in (429, 500, 502, 503,
-                                   504) and attempt <= max_retries:
+                if resp.status in (429, 500, 502, 503, 504) and attempt <= max_retries:
                     log_search.warning(f"Response Header from POE2 trade2={resp.headers}")
                     ra = _retry_after_seconds(resp)
                     ra_hdr = resp.headers.get("Retry-After")
                     if ra is not None:
-                        log_search.warning(
-                            "search HTTP %s; Retry-After header=%r -> waiting %.2fs (attempt %d/%d)",
-                            resp.status, ra_hdr, ra, attempt, max_retries)
+                        log_search.warning("search HTTP %s; Retry-After header=%r -> waiting %.2fs (attempt %d/%d)",
+                                           resp.status, ra_hdr, ra, attempt, max_retries)
                         await asyncio.sleep(ra)
                     else:
                         delay = _expo_backoff(attempt)
-                        log_search.warning(
-                            "search HTTP %s; Retry-After missing; backoff=%.2fs (attempt %d/%d)",
-                            resp.status, delay, attempt, max_retries)
+                        log_search.warning("search HTTP %s; Retry-After missing; backoff=%.2fs (attempt %d/%d)",
+                                           resp.status, delay, attempt, max_retries)
                         await asyncio.sleep(delay)
                         await asyncio.sleep(post_request_pause)
                     consec_429 = consec_429 + 1 if resp.status == 429 else 0
                     if consec_429 >= 3:
                         cool = 30.0
-                        log_search.warning(
-                            "search received %d consecutive 429s; cooling down for %.0fs",
-                            consec_429, cool)
+                        log_search.warning("search received %d consecutive 429s; cooling down for %.0fs", consec_429, cool)
                         await asyncio.sleep(cool)
                         consec_429 = 0
                     continue
 
                 body_snip = (await resp.text())[:300]
-                log_search.error(
-                    "search non-retriable or exhausted; status=%s, body~%r",
-                    resp.status, body_snip)
+                log_search.error("search non-retriable or exhausted; status=%s, body~%r", resp.status, body_snip)
                 raise aiohttp.ClientResponseError(
                     request_info=resp.request_info,
                     history=resp.history,
@@ -367,27 +324,34 @@ async def post_trade2_search(
             log_search.debug("search response JSON received")
 
         if post_request_pause:
-            log_search.debug("Polite pause after request: %.2fs",
-                             post_request_pause)
+            log_search.debug("Polite pause after request: %.2fs", post_request_pause)
             await asyncio.sleep(post_request_pause)
         return _process_search_json(data)
 
-
 @dataclass(frozen=True)
 class Trade2Price:
-    amount: Optional[float]
-    currency: Optional[str]
+    # original listing price
+    amount_original: Optional[float]
+    currency_original: Optional[str]
     ptype: Optional[str]
-
+    # converted to base currency
+    amount_in_base: Optional[float]
+    currency_in_base: Optional[str]
+    rate_to_base: Optional[float] # fx used for original->base
+    
 
 @dataclass(frozen=True)
 class Trade2ListingRecord:
+    # Listing / identity
     id: str
     league: Optional[str]
     realm: Optional[str]
     indexed: Optional[str]
     seller: Optional[str]
     price: Trade2Price
+    fee: Optional[int] # from listing.fee
+
+    # Item meta
     verified: Optional[bool]
     rarity: Optional[str]
     base_type: Optional[str]
@@ -395,160 +359,108 @@ class Trade2ListingRecord:
     name: Optional[str]
     ilvl: Optional[int]
     identified: Optional[bool]
-    corrupted: Optional[bool]
-    category: Optional[str]
-    dps: Optional[float]
-    pdps: Optional[float]
-    edps: Optional[float]
-    aps: Optional[float]
-    crit_chance: Optional[float]
-    properties_raw: Tuple[Tuple[str, Tuple[Tuple[Any, Any], ...], Optional[int],
-                                Optional[int]], ...]
-    requirements_raw: Tuple[Tuple[str, Tuple[Tuple[Any, Any], ...],
-                                  Optional[int], Optional[int]], ...]
-    req_level: Optional[int]
-    req_str: Optional[int]
-    req_dex: Optional[int]
-    req_int: Optional[int]
-    granted_skills: Tuple[str, ...]
-    skill_hashes: Tuple[str, ...]
-    mods_implicit: Tuple[str, ...]
-    mods_explicit: Tuple[str, ...]
-    hashes_implicit: Tuple[str, ...]
-    hashes_explicit: Tuple[str, ...]
+    corrupted: bool
+    duplicated: bool
+    unmodifiable: bool
+    category: Optional[str] # derived from properties[0].name
 
-    # parsing helpers
-    @staticmethod
-    def _num(x: Any) -> Optional[float]:
-        try:
-            return float(str(x).replace("%", ""))
-        except Exception:
-            return None
+    # Stack info
+    stack_size: Optional[int]
+    max_stack_size: Optional[int]
+
+    # Gem-related extras
+    support: Optional[bool]
+    gem_sockets: List[str]
+    weapon_requirements: List[Dict[str, Any]]
+    gem_tabs: List[Dict[str, Any]]
+    gem_background: Optional[str]
+    gem_skill: Optional[str]
+    sec_descr_text: Optional[str]
+    flavour_text: List[str]
+    descr_text: Optional[str]
+
+    # Raw blocks
+    sockets: List[Dict[str, Any]]
+    properties: List[Dict[str, Any]]
+    requirements: List[Dict[str, Any]]
+    granted_skills: List[Dict[str, Any]]
+    socketed_items: List[Dict[str, Any]]
+    extended: Dict[str, Any]
+
+    # Mods & flags
+    rune_mods: List[str]
+    desecrated_mods: List[str]
+    implicit_mods: List[str]
+    explicit_mods: List[str]
+    veiled_mods: List[str]
+    desecrated: bool
+
 
     @staticmethod
-    def _to_int(x: Any) -> Optional[int]:
-        try:
-            return int(str(x))
-        except Exception:
-            return None
-
-    @staticmethod
-    def _price(p: Dict[str, Any]) -> "Trade2Price":
+    def _price(p: Dict[str, Any], converter: Optional["PriceConverter"]) -> "Trade2Price":
         amt = p.get("amount")
+        cur_raw = p.get("currency")
+        typ = p.get("type")
+        try:
+            amt_f = float(str(amt)) if amt is not None else None
+        except Exception:
+            amt_f = None
+
+        base_amt = None
+        rate = None
+        base_cur = converter.base_currency if converter else None
+        cur = (TRADE_API_CURRENCY_NAMES_TO_AOEAH_CURRENCY_NAMES.get(str(cur_raw).strip().lower(), cur_raw)
+               if converter else cur_raw)
+
+        if converter and amt_f is not None and cur:
+            base_amt, rate = converter.convert(amt_f, cur)
+
         return Trade2Price(
-            amount=Trade2ListingRecord._num(amt) if amt is not None else None,
-            currency=p.get("currency"),
-            ptype=p.get("type"),
+            amount_original=amt_f,
+            currency_original=cur,
+            ptype=typ,
+            amount_in_base=base_amt,
+            currency_in_base=base_cur,
+            rate_to_base=rate,
         )
 
     @staticmethod
-    def _category(icat: Any) -> Optional[str]:
-        if isinstance(icat, str):
-            return icat
-        if isinstance(icat, list) and icat:
-            return icat[0]
-        if isinstance(icat, dict):
-            for k, v in icat.items():
-                if v:
-                    return k
-        return None
-
-    @staticmethod
-    def _norm(s: str) -> str:
-        return s.replace("[", "").replace("]", "").lower()
-
-    @classmethod
-    def _aps_crit(cls, props: Any) -> Tuple[Optional[float], Optional[float]]:
-        aps = crit = None
-        for p in props or []:
-            name = cls._norm(p.get("name", ""))
-            vals = p.get("values") or []
-            v0 = vals[0][0] if vals and vals[0] else None
-            if "attacks per second" in name:
-                aps = aps or cls._num(v0)
-            elif "critical" in name and "chance" in name:
-                crit = crit or cls._num(v0)
-        return aps, crit
-
-    @staticmethod
-    def _freeze_prop_like(
-        seq: Any
-    ) -> Tuple[Tuple[str, Tuple[Tuple[Any, Any], ...], Optional[int],
-                     Optional[int]], ...]:
-        out: List[Tuple[str, Tuple[Tuple[Any, Any], ...], Optional[int],
-                        Optional[int]]] = []
-        for obj in seq or []:
-            vals = tuple(
-                ((v[0] if isinstance(v, list) else v),
-                 (v[1] if isinstance(v, list) and len(v) > 1 else None))
-                for v in (obj.get("values") or []))
-            out.append((obj.get("name"), vals, obj.get("displayMode"),
-                        obj.get("type")))
-        return tuple(out)
+    def _category_from_properties(props: List[Dict[str, Any]]) -> Optional[str]:
+        """
+        Use the first property's name as the category.
+        Examples:
+          {"name": "[Crossbow]"} -> "Crossbow"
+          {"name": "[Evasion|Evasion Rating]"} -> "Evasion"
+          {"name": "Waystone"} -> "Waystone"
+        """
+        if not props:
+            return None
+        raw = (props[0] or {}).get("name", "")
+        cat = re.sub(r"[\[\]]", "", str(raw)).split("|")[0].strip()
+        return cat or None
 
     @classmethod
-    def _req_ints(
-        cls, reqs: Any
-    ) -> Tuple[Optional[int], Optional[int], Optional[int], Optional[int]]:
-        lvl = s = d = i = None
-        for r in reqs or []:
-            name = cls._norm(r.get("name", ""))
-            vals = r.get("values") or []
-            v0 = vals[0][0] if vals and vals[0] else None
-            if "level" in name:
-                lvl = cls._to_int(v0)
-            elif "strength" in name or name == "str":
-                s = cls._to_int(v0)
-            elif "dexterity" in name or name == "dex":
-                d = cls._to_int(v0)
-            elif "intelligence" in name or name == "int":
-                i = cls._to_int(v0)
-        return lvl, s, d, i
-
-    @staticmethod
-    def _skill_names_and_hashes(
-            item: Dict[str, Any]) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
-        names: List[str] = []
-        for s in item.get("grantedSkills") or []:
-            txt = s["values"][0][0] if s.get("values") else s.get("name", "")
-            m = re.match(r"Level\s+(\d+)\s+(.+)", str(txt))
-            names.append(f"{m.group(2)} ({m.group(1)})" if m else str(txt))
-        # hashes flattened from extended.hashes.skill separately
-        return tuple(names), tuple()
-
-    @staticmethod
-    def _hashes(lst: Any) -> Tuple[str, ...]:
-        return tuple(h[0] for h in (lst or []))
-
-    @staticmethod
-    def _jsonify(o: Any) -> Any:
-        if isinstance(o, tuple):
-            return [Trade2ListingRecord._jsonify(x) for x in o]
-        if isinstance(o, dict):
-            return {k: Trade2ListingRecord._jsonify(v) for k, v in o.items()}
-        return o
-
-    @classmethod
-    def from_api(cls, listing: Dict[str, Any]) -> "Trade2ListingRecord":
+    def from_api(cls, listing: Dict[str, Any], converter: Optional["PriceConverter"]) -> "Trade2ListingRecord":
         item = listing.get("item") or {}
         lst = listing.get("listing") or {}
-        acc = lst.get("account") or {}
-        ext = item.get("extended") or {}
-        hashes = ext.get("hashes", {}) or {}
+        acc = (lst.get("account") or {})
 
-        props = item.get("properties")
-        reqs = item.get("requirements")
-        aps, crit = cls._aps_crit(props)
-        lvl, rs, rd, ri = cls._req_ints(reqs)
-        skill_names, _ = cls._skill_names_and_hashes(item)
+        price_obj = cls._price(lst.get("price") or {}, converter)
 
-        rec = cls(
+        props: List[Dict[str, Any]] = item.get("properties") or []
+        category = cls._category_from_properties(props)
+
+        return cls(
+            # listing/identity
             id=listing.get("id"),
             league=item.get("league"),
             realm=item.get("realm"),
             indexed=lst.get("indexed"),
             seller=acc.get("name"),
-            price=cls._price(lst.get("price") or {}),
+            price=price_obj,
+            fee=lst.get("fee"),
+
+            # meta
             verified=item.get("verified"),
             rarity=item.get("rarity"),
             base_type=item.get("baseType"),
@@ -556,117 +468,114 @@ class Trade2ListingRecord:
             name=item.get("name"),
             ilvl=item.get("ilvl"),
             identified=item.get("identified"),
-            corrupted=item.get("corrupted"),
-            category=cls._category(item.get("category")),
-            dps=cls._num(ext.get("dps")),
-            pdps=cls._num(ext.get("pdps")),
-            edps=cls._num(ext.get("edps")),
-            aps=aps,
-            crit_chance=crit,
-            properties_raw=cls._freeze_prop_like(props),
-            requirements_raw=cls._freeze_prop_like(reqs),
-            req_level=lvl,
-            req_str=rs,
-            req_dex=rd,
-            req_int=ri,
-            granted_skills=tuple(skill_names),
-            skill_hashes=tuple(h[0] for h in (hashes.get("skill") or [])),
-            mods_implicit=tuple(item.get("implicitMods") or []),
-            mods_explicit=tuple(item.get("explicitMods") or []),
-            hashes_implicit=tuple(h[0] for h in (hashes.get("implicit") or [])),
-            hashes_explicit=tuple(h[0] for h in (hashes.get("explicit") or [])),
-        )
-        return rec
+            corrupted=bool(item.get("corrupted", False)),
+            duplicated=bool(item.get("duplicated", False)),
+            unmodifiable=bool(item.get("unmodifiable", False)),
+            category=category,
 
-    # ---- Row serialization ----
+            # stack info
+            stack_size=item.get("stackSize"),
+            max_stack_size=item.get("maxStackSize"),
+
+            # gem-related
+            support=item.get("support"),
+            gem_sockets=item.get("gemSockets") or [],
+            weapon_requirements=item.get("weaponRequirements") or [],
+            gem_tabs=item.get("gemTabs") or [],
+            gem_background=item.get("gemBackground"),
+            gem_skill=item.get("gemSkill"),
+            sec_descr_text=item.get("secDescrText"),
+            flavour_text=item.get("flavourText") or [],
+            descr_text=item.get("descrText"),
+
+            # raw blocks
+            sockets=item.get("sockets") or [],
+            properties=props,
+            requirements=item.get("requirements") or [],
+            granted_skills=item.get("grantedSkills") or [],
+            socketed_items=item.get("socketedItems") or [],
+            extended=item.get("extended") or {},
+
+            # mods & flags
+            rune_mods=item.get("runeMods") or [],
+            desecrated_mods=item.get("desecratedMods") or [],
+            implicit_mods=item.get("implicitMods") or [],
+            explicit_mods=item.get("explicitMods") or [],
+            veiled_mods=item.get("veiledMods") or [],
+            desecrated=bool(item.get("desecrated", False)),
+        )
+
     def to_row(self) -> Dict[str, Any]:
         return {
-            "id":
-                self.id,
-            "league":
-                self.league,
-            "realm":
-                self.realm,
-            "indexed":
-                self.indexed,
-            "seller":
-                self.seller,
-            "price_amount":
-                self.price.amount,
-            "price_currency":
-                self.price.currency,
-            "price_type":
-                self.price.ptype,
-            "verified":
-                self.verified,
-            "rarity":
-                self.rarity,
-            "base_type":
-                self.base_type,
-            "type_line":
-                self.type_line,
-            "name":
-                self.name,
-            "ilvl":
-                self.ilvl,
-            "identified":
-                self.identified,
-            "corrupted":
-                self.corrupted,
-            "category":
-                self.category,
-            "dps":
-                self.dps,
-            "pdps":
-                self.pdps,
-            "edps":
-                self.edps,
-            "aps":
-                self.aps,
-            "crit_chance":
-                self.crit_chance,
-            "properties_raw":
-                json.dumps(self._jsonify(self.properties_raw),
-                           ensure_ascii=False),
-            "requirements_raw":
-                json.dumps(self._jsonify(self.requirements_raw),
-                           ensure_ascii=False),
-            "req_level":
-                self.req_level,
-            "req_str":
-                self.req_str,
-            "req_dex":
-                self.req_dex,
-            "req_int":
-                self.req_int,
-            "granted_skills":
-                "|".join(self.granted_skills),
-            "skill_hashes":
-                "|".join(self.skill_hashes),
-            "mods_implicit":
-                "|".join(self.mods_implicit),
-            "mods_explicit":
-                "|".join(self.mods_explicit),
-            "hashes_implicit":
-                "|".join(self.hashes_implicit),
-            "hashes_explicit":
-                "|".join(self.hashes_explicit),
+            "id": self.id,
+            "league": self.league,
+            "realm": self.realm,
+            "indexed": self.indexed,
+            "seller": self.seller,
+            # listing extras
+            "fee": self.fee,
+            # price
+            "price_amount_original": self.price.amount_original,
+            "price_currency_original": self.price.currency_original,
+            "price_type": self.price.ptype,
+            "price_amount_in_base": self.price.amount_in_base,
+            "price_currency_in_base": self.price.currency_in_base,
+            "price_rate_to_base": self.price.rate_to_base,
+            # meta
+            "verified": self.verified,
+            "rarity": self.rarity,
+            "base_type": self.base_type,
+            "type_line": self.type_line,
+            "name": self.name,
+            "ilvl": self.ilvl,
+            "identified": self.identified,
+            "corrupted": self.corrupted,
+            "duplicated": self.duplicated,
+            "unmodifiable": self.unmodifiable,
+            "category": self.category,
+            # stack
+            "stack_size": self.stack_size,
+            "max_stack_size": self.max_stack_size,
+            # gem-related
+            "support": self.support,
+            "gem_sockets": json.dumps(self.gem_sockets, ensure_ascii=False),
+            "weapon_requirements": json.dumps(self.weapon_requirements, ensure_ascii=False),
+            "gem_tabs": json.dumps(self.gem_tabs, ensure_ascii=False),
+            "gem_background": self.gem_background,
+            "gem_skill": self.gem_skill,
+            "sec_descr_text": self.sec_descr_text,
+            "flavour_text": json.dumps(self.flavour_text, ensure_ascii=False),
+            "descr_text": self.descr_text,
+            # raw blocks
+            "sockets": json.dumps(self.sockets, ensure_ascii=False),
+            "properties": json.dumps(self.properties, ensure_ascii=False),
+            "requirements": json.dumps(self.requirements, ensure_ascii=False),
+            "granted_skills": json.dumps(self.granted_skills, ensure_ascii=False),
+            "socketed_items": json.dumps(self.socketed_items, ensure_ascii=False),
+            "extended": json.dumps(self.extended, ensure_ascii=False),
+            # mods & flags
+            "rune_mods": json.dumps(self.rune_mods, ensure_ascii=False),
+            "desecrated_mods": json.dumps(self.desecrated_mods, ensure_ascii=False),
+            "implicit_mods": json.dumps(self.implicit_mods, ensure_ascii=False),
+            "explicit_mods": json.dumps(self.explicit_mods, ensure_ascii=False),
+            "veiled_mods": json.dumps(self.veiled_mods, ensure_ascii=False),
+            "desecrated": self.desecrated,
         }
 
 
 async def fetch_listings_batch(
     session: aiohttp.ClientSession,
-    *,
     search_id: str,
     ids: List[str],
     headers: Dict[str, str],
     timeout: int,
     max_retries: int,
     post_request_pause: float,
+    converter: Optional[PriceConverter],
 ) -> List[Trade2ListingRecord]:
     """
     Fetch listings ONE BY ONE to avoid 'Invalid query' from overly long id lists.
-    Logs retry behavior, Retry-After seconds, and per-id success/failure.
+    Includes FX conversion to base currency.
     """
     if not ids:
         log_fetch.info("No ids to fetch; returning empty list")
@@ -705,9 +614,9 @@ async def fetch_listings_batch(
                                 await asyncio.sleep(post_request_pause)
                         continue
 
-                    body_snip = (await resp.text())[:300]
-                    log_fetch.error("[id=%s] FAIL: HTTP %s %r", iid, resp.status, body_snip)
-                    break  # move on to next id
+                    body = (await resp.text())
+                    log_fetch.error("[id=%s] FAIL: HTTP %s %r", iid, resp.status, body)
+                    break
 
                 try:
                     data = await resp.json(content_type=None)
@@ -728,21 +637,23 @@ async def fetch_listings_batch(
                 break
 
             try:
-                rec = Trade2ListingRecord.from_api(raw)
+                rec = Trade2ListingRecord.from_api(raw, converter)
                 log_fetch.info(
-                    "[id=%s] SUCCESS: seller=%s price=%s %s name=%s base=%s ilvl=%s",
+                    "[id=%s] SUCCESS: seller=%s price_raw=%s %s price_base=%s %s name=%s base=%s ilvl=%s",
                     rec.id,
                     rec.seller,
-                    rec.price.amount,
-                    rec.price.currency,
+                    rec.price.amount_original,
+                    rec.price.currency_original,
+                    rec.price.amount_in_base,
+                    rec.price.currency_in_base,
                     (rec.name or rec.type_line or "").strip(),
-                    (rec.base_type or "").strip(),
+                    (rec.base_type).strip() or "",
                     rec.ilvl,
                 )
                 out.append(rec)
             except Exception as e:
                 log_fetch.warning("[id=%s] FAIL: parse error: %s", iid, e)
-            break  # done with this id
+            break
 
     log_fetch.info("Parsed %d/%d listings successfully", len(out), len(ids))
     return out
@@ -757,10 +668,8 @@ async def search(
     timeout: int,
     max_retries: int,
     post_request_pause: float,
+    converter: Optional[PriceConverter],
 ) -> List[Trade2ListingRecord]:
-    """
-    Run trade2 search then fetch all listings in a single batched request.
-    """
     log_search.info("Preparing search; realm=%s, league=%s", realm, league)
 
     headers = dict(headers)
@@ -786,10 +695,8 @@ async def search(
         raise RuntimeError(f"trade2 search failed: {msg}")
 
     ids = list(outcome.ids or [])
-    log_search.info(
-        "Search OK: ids=%d total=%s complexity=%s truncated=%s search_id=%s",
-        len(ids), outcome.total, outcome.complexity, outcome.truncated,
-        outcome.search_id)
+    log_search.info("Search OK: ids=%d total=%s complexity=%s truncated=%s search_id=%s",
+                    len(ids), outcome.total, outcome.complexity, outcome.truncated, outcome.search_id)
     if not ids:
         log_search.info("No ids returned by search; nothing to fetch")
         return []
@@ -802,20 +709,17 @@ async def search(
         timeout=timeout,
         max_retries=max_retries,
         post_request_pause=post_request_pause,
+        converter=converter,
     )
 
-    log_fetch.info("Fetched %d/%d listings (search_id=%s)", len(results),
-                   len(ids), outcome.search_id or "")
+    log_fetch.info("Fetched %d/%d listings (search_id=%s)", len(results), len(ids), outcome.search_id or "")
     return results
 
-
 def records_to_dataframe(records: List[Trade2ListingRecord]) -> pd.DataFrame:
-    """Convert parsed listing records into a pandas DataFrame."""
     log_fetch.info("Converting %d records into DataFrame", len(records))
     df = pd.DataFrame([r.to_row() for r in records])
     log_fetch.info("DataFrame created with shape %s", tuple(df.shape))
     return df
-
 
 def search_to_dataframe(
     config_path: str = "config.yaml",
@@ -823,16 +727,9 @@ def search_to_dataframe(
     log_level: str = "INFO",
 ) -> pd.DataFrame:
     """
-    One-call convenience:
-      - Sets up logging (console + file)
-      - Loads config (masked logging)
-      - Builds headers/payload/options with summaries
-      - Runs polite trade2 search + single batched fetch
-      - Converts to DataFrame (records_to_dataframe)
-      - Optionally saves to CSV
-      - Returns the DataFrame
+    Loads config, builds FX cache, runs search, converts prices to base currency,
+    returns DataFrame with both raw and base prices.
     """
-    # Ensure logging is configured for both console and file
     setup_logging(log_level)
 
     async def _run() -> pd.DataFrame:
@@ -841,8 +738,13 @@ def search_to_dataframe(
         headers = headers_from_config(cfg)
         payload = payload_from_config(cfg)
 
-        log_search.info("Initializing aiohttp session with total timeout=%ss",
-                        opts["timeout"])
+        # Build currency cache for the chosen server/base currency
+        log_search.info("Building currency cache for server=%s (base=%s)",
+                        opts["base_server"].value, opts["base_currency"])
+        fx_cache = get_currency_cache([opts["base_server"]], log_level=log_level)
+        converter = PriceConverter(fx_cache, opts["base_server"], opts["base_currency"])
+
+        log_search.info("Initializing aiohttp session with total timeout=%ss", opts["timeout"])
         total_timeout = aiohttp.ClientTimeout(total=opts["timeout"])
         async with aiohttp.ClientSession(timeout=total_timeout) as session:
             log_search.info("Starting search workflow")
@@ -855,6 +757,7 @@ def search_to_dataframe(
                 timeout=opts["timeout"],
                 max_retries=opts["max_retries"],
                 post_request_pause=opts["post_request_pause"],
+                converter=converter,
             )
 
         df = records_to_dataframe(records)
@@ -866,6 +769,8 @@ def search_to_dataframe(
 
     return asyncio.run(_run())
 
-df = search_to_dataframe("config.yaml", save_csv="results.csv", log_level="INFO")
-print(f"df head={df.head()}")
-print(f"len df={len(df)}")
+
+if __name__ == "__main__":
+    df = search_to_dataframe("config.yaml", save_csv="results.csv", log_level="INFO")
+    print(f"df head=\n{df.head()}")
+    print(f"len df={len(df)}")
