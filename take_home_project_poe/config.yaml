@@ -1,0 +1,28 @@
+poe_sessid: "02e07d1543f1443aec3473e200db08c6"
+cf_clearance: "A9aiTB9Fp6vtOSkS3H.ZAW7qMkD4xBCCMX06CE0lWLY-1756572188-1.2.1.1-qvYp6iSz44RhXfFLompMb5WvVp.jYSbbM8nDtTeBa5RStP4PBdCvgV_laRjjucr5sVYdjdab9.ra4EEPxDIGgMERSIFNrk9x.RgNE.pusAeuaApLJ11hGtYQvzGVCGYkIxrI1RkCL0TElWr9.I9UDds4HPUzk2blgspTWwYJARh.WjXxQVX_1kMG8j.nROHbgmKTm3jekV59Ggua5KMZhQ271JjaqU9HZeFj6B2lAkg"
+# Core knobs
+league: "Rise of the Abyssal"
+realm: "poe2"
+
+# Throughput / politeness
+num_workers: 6 # optional; if omitted we default to 6 or to `concurrency`
+concurrency: 2 # optional; limits simultaneous fetches across workers
+rps: 1.0 # requests per second budget shared by all tasks
+timeout: 30 # aiohttp total timeout (seconds)
+max_retries: 5 # retries for 429/5xx
+
+# adjust filters for the query
+stats:
+  - type: "and"
+    filters: []
+    disabled: false
+
+filters:
+  type_filters:
+    filters:
+      category:
+        option: "weapon.wand"
+    disabled: false
+
+sort:
+  price: "asc"
