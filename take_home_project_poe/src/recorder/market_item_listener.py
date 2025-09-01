@@ -10,13 +10,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from main import setup_logging
 
-from src.data.market_currency_listener import (
+from take_home_project_poe.misc.poe2_currency_recorder_web_scrape import (
     get_currency_cache,
     get_rate as get_fx_rate,
     Server,
 )
 
-from src.data.constants import TRADE_API_CURRENCY_NAMES_TO_AOEAH_CURRENCY_NAMES
+from src.recorder.constants import CURRENCY_MAP
 
 import aiohttp
 import pandas as pd
@@ -26,6 +26,7 @@ POE_BASE_URL = "https://www.pathofexile.com"
 TRADE2_SEARCH_URL = POE_BASE_URL + "/api/trade2/search/{realm}/{league}"
 TRADE2_FETCH_URL = POE_BASE_URL + "/api/trade2/fetch/{ids}?query={search_id}"
 CONFIG_PATH = "config.yaml"
+COOKIES_PATH = "poe_cookies_config.json"
 
 HEADERS = {
     "Accept":
@@ -88,7 +89,7 @@ class PriceConverter:
         self.cache = cache
         self.server = server
         # Apply the same mapping to base currency (in case someone passes "ex" etc.)
-        self.base_currency = TRADE_API_CURRENCY_NAMES_TO_AOEAH_CURRENCY_NAMES.get(
+        self.base_currency = CURRENCY_MAP.get(
             str(base_currency).strip().lower(),
             base_currency,
         )
@@ -100,7 +101,7 @@ class PriceConverter:
         if amount is None or not currency:
             raise ValueError(f"PriceConverter.convert failed; amount={amount}, currency={currency}")
 
-        src = TRADE_API_CURRENCY_NAMES_TO_AOEAH_CURRENCY_NAMES.get(str(currency).strip().lower(), currency)
+        src = CURRENCY_MAP.get(str(currency).strip().lower(), currency)
         dst = self.base_currency
 
         if src == dst:
@@ -409,7 +410,7 @@ class Trade2ListingRecord:
         base_amt = None
         rate = None
         base_cur = converter.base_currency if converter else None
-        cur = (TRADE_API_CURRENCY_NAMES_TO_AOEAH_CURRENCY_NAMES.get(str(cur_raw).strip().lower(), cur_raw)
+        cur = (CURRENCY_MAP.get(str(cur_raw).strip().lower(), cur_raw)
                if converter else cur_raw)
 
         if converter and amt_f is not None and cur:

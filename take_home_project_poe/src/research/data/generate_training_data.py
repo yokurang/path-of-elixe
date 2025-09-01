@@ -27,11 +27,11 @@ from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 import aiohttp
 
-from src.data.constants import CATEGORIES
+from src.recorder.constants import CATEGORIES
 
 # ---- Import your existing pipeline bits
-from src.data.market_currency_listener import get_currency_cache, Server
-from src.data.market_item_listener import ( 
+from take_home_project_poe.misc.poe2_currency_recorder_web_scrape import get_currency_cache, Server
+from src.recorder.market_item_listener import ( 
     setup_logging,
     options_from_config,
     headers_from_config,
@@ -208,7 +208,7 @@ async def _search_once_with_cfg(
             "No FX cache provided; fetching live | base_currency=%s base_server=%s realm=%s league=%s",
             opts["base_currency"], opts["base_server"].value, opts["realm"], opts["league"]
         )
-        from src.data.market_currency_listener import get_currency_cache as _get_cc
+        from take_home_project_poe.misc.poe2_currency_recorder_web_scrape import get_currency_cache as _get_cc
         fx_cache = _get_cc([opts["base_server"]], log_level=log_level)
         converter = PriceConverter(fx_cache, opts["base_server"], opts["base_currency"])
     else:
