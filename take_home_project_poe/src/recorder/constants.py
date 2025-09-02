@@ -56,10 +56,10 @@ FULL_TO_SHORT_CURRENCY_MAP = {v: k for k, v in SHORT_TO_FULL_CURRENCY_MAP.items(
 
 # items
 ITEM_TYPES = {
-    'weapon': 'Any Weapon',
-    'weapon.one': 'One-Handed Weapon',
-    'weapon.onemelee': 'One-Handed Melee Weapon',
-    'weapon.twomelee': 'Two-Handed Melee Weapon',
+    # 'weapon': 'Any Weapon',
+    # 'weapon.one': 'One-Handed Weapon',
+    # 'weapon.onemelee': 'One-Handed Melee Weapon',
+    # 'weapon.twomelee': 'Two-Handed Melee Weapon',
     'weapon.bow': 'Bow',
     'weapon.claw': 'Claw',
     'weapon.dagger': 'Any Dagger',

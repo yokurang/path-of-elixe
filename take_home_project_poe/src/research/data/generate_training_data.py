@@ -31,7 +31,7 @@ from src.recorder.constants import CATEGORIES
 
 # ---- Import your existing pipeline bits
 from take_home_project_poe.misc.poe2_currency_recorder_web_scrape import get_currency_cache, Server
-from src.recorder.market_item_listener import ( 
+from take_home_project_poe.misc.market_item_listener_bak import ( 
     setup_logging,
     options_from_config,
     headers_from_config,
