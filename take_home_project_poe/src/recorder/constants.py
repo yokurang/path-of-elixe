@@ -40,16 +40,27 @@ CURRENCY_MAP: Dict[str, str] = {
 
 # currencies
 SHORT_TO_FULL_CURRENCY_MAP = {
-    "exalted": "Exalted Orb",
-    "divine": "Divine Orb",
-    "chance": "Orb of Chance",
-    "regal": "Regal Orb",
-    "chaos": "Chaos Orb",
-    "aug": "Orb of Augmentation",
-    "transmute": "Orb of Transmutation",
-    "mirror": "Mirror of Kalandra",
-    "annul": "Orb of Annulment",
-    "alch": "Orb of Alchemy",
+  "alch": "Orb of Alchemy",
+  "annul": "Orb of Annulment",
+  "artificers": "Artificer's Orb",
+  "aug": "Orb of Augmentation",
+  # "bauble": "Glassblower's Bauble",
+  "chance": "Orb of Chance",
+  "chaos": "Chaos Orb",
+  "divine": "Divine Orb",
+  "etcher": "Arcanist's Etcher",
+  "exalted": "Exalted Orb",
+  "fracturing-orb": "Fracturing Orb",
+  # "gcp": "Gemcutter's Prism",
+  # "hinekoras-lock": "Hinekora's Lock",
+  "mirror": "Mirror of Kalandra",
+  "regal": "Regal Orb",
+  # "scrap": "Armourer's Scrap",
+  # "sep": "Quality Currency",
+  "transmute": "Orb of Transmutation",
+  "vaal": "Vaal Orb",
+  # "whetstone": "Blacksmith's Whetstone",
+  # "wisdom": "Scroll of Wisdom"
 }
 
 FULL_TO_SHORT_CURRENCY_MAP = {v: k for k, v in SHORT_TO_FULL_CURRENCY_MAP.items()}
