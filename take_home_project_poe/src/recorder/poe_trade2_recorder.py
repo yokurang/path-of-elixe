@@ -1,4 +1,3 @@
-import os
 import asyncio
 import json
 import logging
@@ -41,7 +40,7 @@ from src.recorder.poe_currency_recorder import Quote, FXCache  # noqa: F401
 MAX_RESULTS = 100
 DEFAULT_TIMEOUT = 30
 DEFAULT_MAX_RETRIES = 5
-POLITE_PAUSE = 1.0  # short sleep between requests to be nice to API
+POLITE_PAUSE = 1.0 # short sleep between requests to be nice to API
 
 HEADERS = {
     "Accept": "*/*",
@@ -73,10 +72,6 @@ for lg in (log_search, log_fetch):
     if not lg.handlers:
         lg.addHandler(logging.NullHandler())
 
-
-# ---------------------------
-# Small utilities
-# ---------------------------
 def _retry_after_seconds(resp: aiohttp.ClientResponse) -> Optional[float]:
     ra_raw = resp.headers.get("Retry-After")
     if ra_raw:
@@ -129,7 +124,7 @@ def _masked_cookies_for_log(obj: Dict[str, Any]) -> Dict[str, Any]:
 
 def _summarize_payload(payload: Dict[str, Any]) -> str:
     q = payload.get("query", {})
-    status = (q.get("status") or {}).get("option")
+    status = q.get("status").get("option")
     sort = payload.get("sort")
     filters = q.get("filters") or {}
     type_filters = (filters.get("type_filters") or {}).get("filters") or {}
@@ -144,7 +139,7 @@ def _summarize_payload(payload: Dict[str, Any]) -> str:
 # ---------------------------
 def load_league_realm(path: Path = CONFIG_PATH) -> Tuple[str, str]:
     """Read only league/realm from config.yaml, with sane defaults."""
-    league = "Rise of the Abyssal"
+    league = "Standard"
     realm = "poe2"
     try:
         with path.open("r", encoding="utf-8") as f:
@@ -184,9 +179,6 @@ def headers_with_cookies(base: Dict[str, str], cookies: Dict[str, str]) -> Dict[
     return h
 
 
-# ---------------------------
-# FX cache view & loader
-# ---------------------------
 @dataclass(frozen=True)
 class _FXView:
     pair_rates_full: Dict[Tuple[str, str], float]
@@ -239,7 +231,7 @@ def _extract_fx_view(obj: Any) -> _FXView:
 
 def load_fx_cache_or_raise(path: Path = CURRENCY_CACHE_PATH) -> _FXView:
     """
-    Load cache/currency_fx.pkl robustly. First try normal pickle; if that fails
+    Load cache/currency_fx.bak.pkl robustly. First try normal pickle; if that fails
     due to a class-path mismatch, use a compatibility unpickler that remaps any
     historical 'FXCache'/'Quote' to the real classes from src.recorder.poe_currency_recorder.
     """
@@ -573,7 +565,7 @@ async def post_trade2_search(
     timeout: int,
     max_retries: int,
     polite_pause: float,
-) -> Dict[str, Any]:
+) -> Any | None:
     attempt = 0
     consec_429 = 0
     while True:
@@ -850,9 +842,9 @@ def build_basic_payload(
     *,
     category_key: Optional[str] = None,
     rarity_key: Optional[str] = None,
-    status_option: str = "any",  # "online" or "any"
+    status_option: str = "any",  # "online" or "any", or "securable" for instant buyouts
     sort_key: str = "price",
-    sort_dir: str = "asc",       # "asc"/"desc"
+    sort_dir: str = "asc", # "asc"/"desc"
 ) -> Dict[str, Any]:
     """
     Construct a minimal Trade2 payload focused on category/rarity.

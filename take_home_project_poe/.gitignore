@@ -17,7 +17,7 @@ build/
 .idea/
 .DS_Store
 Thumbs.db
-
+catboost_info/
 .ipynb_checkpoints/
 
 logs/

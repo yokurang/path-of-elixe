@@ -18,12 +18,12 @@ from src.recorder.constants import ITEM_TYPES, ITEM_RARITIES
 # =============================================================================
 # Paths / constants
 # =============================================================================
-TRAINING_DIR = Path("training_data")
+TRAINING_DIR = Path("securable/training_data")
 OVERALL_DIR = TRAINING_DIR / "overall"
 OUTPUT_LOG = Path("output_generate_training_data.log")
 
-# LEAGUE = "Standard"
-LEAGUE = "Rise%20of%20the%20Abyssal"
+LEAGUE = "Standard"
+# LEAGUE = "Rise%20of%20the%20Abyssal"
 BASE_CURRENCY = "Exalted Orb"     # assignment requires Exalted Orb as base
 PER_COMBO_DEFAULT = 100            # ≤50 rows saved per combo (recorder returns up to 100 per search)
 
