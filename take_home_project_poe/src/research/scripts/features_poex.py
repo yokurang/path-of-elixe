@@ -1,7 +1,9 @@
+# features_poex.py
+
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List, Tuple, Any, Optional, Iterable
+from typing import Dict, List, Tuple, Any, Optional, Iterable, Callable
 import math
 import re
 import json
@@ -45,7 +47,7 @@ IMPORTANT_MOD_HASHES = {
     "stat_3639275092": "reduced_requirements",
 }
 
-LEVEL_KEYWORDS = ["lightning", "fire", "cold", "chaos", "bow", "spell"]
+LEVEL_KEYWORDS = ["lightning", "fire", "cold", "chaos", "spell"]
 
 # -----------------------------------------------------------------------------
 # Utils
@@ -92,7 +94,7 @@ def _parse_numeric_avg(text: Any) -> float:
     m = PERCENT_RE.search(s)
     if m:
         v = _to_float(m.group(1))
-        return 0.0 if math.isnan(v) else v  # leave as "percent units"; caller can rescale
+        return 0.0 if math.isnan(v) else v
     m = NUM_RE.search(s)
     if m:
         v = _to_float(m.group(0))
@@ -105,7 +107,7 @@ def _avg_or_first_number(text: str) -> float:
         lo = _to_float(m.group(1)); hi = _to_float(m.group(2))
         if not math.isnan(lo) and not math.isnan(hi):
             return (lo + hi) / 2.0
-    nums = [ _to_float(n) for n in NUM_RE.findall(text) ]
+    nums = [_to_float(n) for n in NUM_RE.findall(text)]
     nums = [n for n in nums if not math.isnan(n)]
     return float(nums[0]) if nums else 0.0
 
@@ -131,21 +133,43 @@ def _coalesce_extended(raw_ext: Any) -> List[dict]:
         return out
     return []
 
+def _to_bool01(v: Any) -> float:
+    """Robust boolean → {0.0, 1.0}."""
+    if isinstance(v, bool):
+        return 1.0 if v else 0.0
+    if isinstance(v, (int, float)) and not math.isnan(v):
+        return 1.0 if v != 0 else 0.0
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in {"true", "t", "yes", "y", "1"}:
+            return 1.0
+        if s in {"false", "f", "no", "n", "0"}:
+            return 0.0
+    return 0.0
+
 # -----------------------------------------------------------------------------
-# Extractors
+# Parsers: base / sockets / requirements / properties / mods / flags
 # -----------------------------------------------------------------------------
-def extract_base_attributes(row: pd.Series) -> Dict[str, float]:
-    """
-    NOTE: We intentionally avoid emitting boolean flags as features.
-    Only continuous basics here.
-    """
+def parse_base_attributes(row: pd.Series) -> Dict[str, float]:
     a: Dict[str, float] = {}
     a["ilvl"] = _to_float(row.get("ilvl", 0))
-    sockets = _safe_parse_json(row.get("sockets", []))
-    a["socket_count"] = float(len(sockets)) if isinstance(sockets, list) else 0.0
     return a
 
-def extract_requirements(row: pd.Series) -> Dict[str, float]:
+def parse_sockets(row: pd.Series) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    sockets = _safe_parse_json(row.get("sockets", []))
+    if isinstance(sockets, list):
+        out["socket_count"] = float(len(sockets))
+        try:
+            out["rune_group_count"] = float(len({d.get("group") for d in sockets if isinstance(d, dict) and "group" in d}))
+        except Exception:
+            out["rune_group_count"] = 0.0
+    else:
+        out["socket_count"] = 0.0
+        out["rune_group_count"] = 0.0
+    return out
+
+def parse_requirements(row: pd.Series) -> Dict[str, float]:
     out: Dict[str, float] = {"req_level": 0.0, "req_str": 0.0, "req_dex": 0.0, "req_int": 0.0}
     reqs = _safe_parse_json(row.get("requirements", row.get("weapon_requirements", [])))
     if isinstance(reqs, list):
@@ -164,60 +188,76 @@ def extract_requirements(row: pd.Series) -> Dict[str, float]:
                 out["req_int"] = val
     return out
 
-def extract_weapon_properties(row: pd.Series) -> Dict[str, float]:
-    props: Dict[str, float] = {}
+def _is_damage_prop(name: str, elem: str) -> bool:
+    name = _normalize_text(name)
+    return (f"{elem} damage" in name)
+
+def parse_weapon_properties(row: pd.Series) -> Dict[str, float]:
+    """
+    Parse property blocks into unified numeric channels.
+    Supports attack and cast weapons; we compute a single 'rate_per_s'.
+    """
+    props: Dict[str, float] = {
+        "phys_damage": 0.0,
+        "chaos_damage": 0.0,
+        "cold_damage": 0.0,
+        "fire_damage": 0.0,
+        "lightning_damage": 0.0,
+        "crit_chance": 0.0,
+        "quality": 0.0,
+        "rate_per_s": 0.0,  # attacks/casts per second (unified)
+    }
     arr = _safe_parse_json(row.get("properties", []))
-    if isinstance(arr, list):
-        for prop in arr:
-            if not isinstance(prop, dict):
-                continue
-            name = _normalize_text(prop.get("name", ""))
-            val = _parse_numeric_avg(_extract_property_value(prop.get("values", [])))
-            if "physical damage" in name:
-                props["phys_damage"] = val
-            elif "chaos damage" in name:
-                props["chaos_damage"] = val
-            elif "cold damage" in name:
-                props["cold_damage"] = val
-            elif "fire damage" in name:
-                props["fire_damage"] = val
-            elif "lightning damage" in name:
-                props["lightning_damage"] = val
-            elif "critical" in name and "chance" in name:
-                props["crit_chance"] = val
-            elif "attacks per second" in name:
-                props["attack_speed"] = val
-            elif "quality" in name:
-                props["quality"] = val
-            elif "armor" in name or "armour" in name:
-                props["armor"] = val
-            elif "evasion" in name:
-                props["evasion"] = val
-            elif "energy shield" in name:
-                props["energy_shield"] = val
+    if not isinstance(arr, list):
+        return props
+
+    for prop in arr:
+        if not isinstance(prop, dict):
+            continue
+        name = _normalize_text(prop.get("name", ""))
+        val = _parse_numeric_avg(_extract_property_value(prop.get("values", [])))
+
+        if _is_damage_prop(name, "physical"):
+            props["phys_damage"] = val
+        elif _is_damage_prop(name, "chaos"):
+            props["chaos_damage"] = val
+        elif _is_damage_prop(name, "cold"):
+            props["cold_damage"] = val
+        elif _is_damage_prop(name, "fire"):
+            props["fire_damage"] = val
+        elif _is_damage_prop(name, "lightning"):
+            props["lightning_damage"] = val
+        elif "attacks per second" in name or "casts per second" in name:
+            props["rate_per_s"] = val
+        elif "critical" in name and "chance" in name:
+            props["crit_chance"] = val
+        elif "quality" in name:
+            props["quality"] = val
+        elif "armor" in name or "armour" in name:
+            props["armor"] = val
+        elif "evasion" in name:
+            props["evasion"] = val
+        elif "energy shield" in name:
+            props["energy_shield"] = val
+
+    props["attack_speed"] = props["rate_per_s"]
     return props
 
-# -----------------------------------------------------------------------------
-# Mods (implicit & explicit treated as attributes)
-# -----------------------------------------------------------------------------
-def extract_mod_attributes(row: pd.Series) -> Dict[str, float]:
+def parse_mod_attributes(row: pd.Series) -> Dict[str, float]:
     out: Dict[str, float] = {
         "implicit_mod_count": 0.0,
         "explicit_mod_count": 0.0,
-        # recognized aggregates
         "mod_add_fire_avg": 0.0,
         "mod_add_cold_avg": 0.0,
         "mod_add_lightning_avg": 0.0,
         "mod_add_chaos_avg": 0.0,
-        "mod_inc_attack_speed_pct": 0.0,  # fraction (0.12 = 12%)
+        "mod_inc_attack_speed_pct": 0.0,
         "mod_inc_crit_chance_pct": 0.0,
         "mod_inc_phys_pct": 0.0,
         "mod_accuracy": 0.0,
-        # “others” buckets
         "other_mods_avg_value": 0.0,
         "other_mods_avg_level": 0.0,
         "other_mods_count": 0.0,
-        # highest explicit peaks
         "highest_explicit_tier_num": 0.0,
         "highest_explicit_level": 0.0,
     }
@@ -244,7 +284,6 @@ def extract_mod_attributes(row: pd.Series) -> Dict[str, float]:
     out["implicit_mod_count"] = float(len(all_implicit))
     out["explicit_mod_count"] = float(len(all_explicit))
 
-    # explicit tier/level peaks
     max_tier_num = 0.0
     max_level = 0.0
     for m in all_explicit:
@@ -285,7 +324,6 @@ def extract_mod_attributes(row: pd.Series) -> Dict[str, float]:
                         used_structured = True
 
         if not used_structured and name:
-            # adds X-Y elemental
             if "adds" in name and "damage" in name:
                 if "fire" in name:
                     out["mod_add_fire_avg"] += _avg_or_first_number(name); return
@@ -296,7 +334,6 @@ def extract_mod_attributes(row: pd.Series) -> Dict[str, float]:
                 if "chaos" in name:
                     out["mod_add_chaos_avg"] += _avg_or_first_number(name); return
 
-            # % increases
             if "attack speed" in name and "%" in name:
                 m = PERCENT_RE.search(name)
                 if m: out["mod_inc_attack_speed_pct"] += (_to_float(m.group(1)) / 100.0); return
@@ -307,11 +344,9 @@ def extract_mod_attributes(row: pd.Series) -> Dict[str, float]:
                 m = PERCENT_RE.search(name)
                 if m: out["mod_inc_phys_pct"] += (_to_float(m.group(1)) / 100.0); return
 
-            # accuracy
             if "accuracy" in name:
                 out["mod_accuracy"] += _avg_or_first_number(name); return
 
-            # +X to level of ...
             if "to level" in name:
                 lvl_val = _avg_or_first_number(name)
                 for kw in LEVEL_KEYWORDS:
@@ -319,7 +354,6 @@ def extract_mod_attributes(row: pd.Series) -> Dict[str, float]:
                         out[f"mod_plus_levels_{kw}"] += lvl_val
                         return
 
-            # fallback → others
             v = _avg_or_first_number(name)
             if v != 0.0:
                 other_vals.append(v); other_lvls.append(level)
@@ -336,32 +370,96 @@ def extract_mod_attributes(row: pd.Series) -> Dict[str, float]:
 
     return out
 
+def parse_boolean_flags(row: pd.Series) -> Dict[str, float]:
+    """
+    One-hot (0/1) boolean flags as numeric features.
+    """
+    return {
+        "is_corrupted": _to_bool01(row.get("corrupted", False)),
+        "is_unmodifiable": _to_bool01(row.get("unmodifiable", False)),
+        "is_duplicated": _to_bool01(row.get("duplicated", False)),
+    }
+
 # -----------------------------------------------------------------------------
-# Per-channel DPS only (no totals to avoid multicollinearity)
+# Derived: DPS channels (always computed)
 # -----------------------------------------------------------------------------
 def derive_channel_dps(feats: Dict[str, float]) -> Dict[str, float]:
     out: Dict[str, float] = {}
-    aps = feats.get("attack_speed", 0.0) or 0.0
+    rps = float(feats.get("rate_per_s", feats.get("attack_speed", 0.0)) or 0.0)
 
     def d(name: str) -> float:
         return float(feats.get(name, 0.0) or 0.0)
 
-    if aps > 0:
-        out["pdps"] = aps * d("phys_damage")
-        out["fdps"] = aps * d("fire_damage")
-        out["cdps"] = aps * d("cold_damage")
-        out["ldps"] = aps * d("lightning_damage")
-        out["chaos_dps"] = aps * d("chaos_damage")
+    if rps > 0:
+        out["pdps"] = rps * d("phys_damage")
+        out["fdps"] = rps * d("fire_damage")
+        out["cdps"] = rps * d("cold_damage")
+        out["ldps"] = rps * d("lightning_damage")
+        out["chaos_dps"] = rps * d("chaos_damage")
     else:
         out["pdps"] = out["fdps"] = out["cdps"] = out["ldps"] = out["chaos_dps"] = 0.0
     return out
 
 # -----------------------------------------------------------------------------
-# Main feature engineering
+# Optional augmentation
+# -----------------------------------------------------------------------------
+def _log1p_pos(s: pd.Series) -> pd.Series:
+    return np.log1p(np.clip(s.astype(float), a_min=0.0, a_max=None))
+
+def _hinge(x: pd.Series, knot: float) -> pd.Series:
+    return np.maximum(0.0, x - knot)
+
+def augment_features(X: pd.DataFrame) -> pd.DataFrame:
+    X = X.copy()
+
+    for c in ["pdps", "chaos_dps",
+              "open_slots_est", "req_level", "req_dex", "req_str", "req_int",
+              "highest_explicit_tier_num", "highest_explicit_level",
+              "implicit_mod_count", "explicit_mod_count",
+              "other_mods_avg_value", "other_mods_count",
+              "crit_chance", "quality", "ilvl"]:
+        if c in X.columns:
+            X[f"log1p_{c}"] = _log1p_pos(X[c])
+
+    def _add_hinges(col: str, prefix: str):
+        if col not in X.columns: return
+        base = X[col]
+        nz = base[base > 0]
+        knots = (nz.quantile([0.2, 0.5, 0.8]).values if len(nz) >= 30 else np.array([base.median()]))
+        for i, k in enumerate(knots, 1):
+            X[f"{prefix}_hinge_{i}"] = _hinge(base, float(k))
+
+    _add_hinges("log1p_pdps", "pdps")
+
+    crit = X.get("crit_chance", 0.0)
+    open_slots = X.get("open_slots_est", 0.0)
+
+    X["pdps_x_crit"]   = X.get("pdps", 0.0) * crit
+    X["chaos_x_crit"]  = X.get("chaos_dps", 0.0) * crit
+    X["pdps_x_open"]   = X.get("pdps", 0.0) * open_slots
+    X["chaos_x_open"]  = X.get("chaos_dps", 0.0) * open_slots
+
+    if "req_dex" in X.columns:
+        X["reqdex_x_pdps"] = X["req_dex"] * X.get("pdps", 0.0)
+
+    X.replace([np.inf, -np.inf], np.nan, inplace=True)
+    X.fillna(0.0, inplace=True)
+
+    var = X.var()
+    zero_var = var[var <= 1e-12].index
+    if len(zero_var) > 0:
+        X.drop(columns=list(zero_var), inplace=True, errors="ignore")
+
+    return X
+
+# -----------------------------------------------------------------------------
+# Feature engineering (base + DPS always)
 # -----------------------------------------------------------------------------
 def make_item_features(
     df: pd.DataFrame,
-    compute_dps: bool = True,
+    *,
+    custom_hooks: Optional[List[Callable[[pd.Series, Dict[str, float]], None]]] = None,
+    augment: bool = False,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     if df.empty:
         raise ValueError("Input DataFrame is empty")
@@ -371,37 +469,39 @@ def make_item_features(
     for _, row in df.iterrows():
         f: Dict[str, float] = {}
 
-        # base & requirements (full vector)
-        f.update(extract_base_attributes(row))
-        f.update(extract_requirements(row))
+        f.update(parse_base_attributes(row))
+        f.update(parse_sockets(row))
+        f.update(parse_requirements(row))
+        f.update(parse_weapon_properties(row))
+        f.update(parse_mod_attributes(row))
+        f.update(parse_boolean_flags(row))  # <-- add one-hot flags
 
-        # properties (avg damages, aps, etc.)
-        f.update(extract_weapon_properties(row))
+        if custom_hooks:
+            for hook in custom_hooks:
+                try:
+                    hook(row, f)
+                except Exception:
+                    pass
 
-        # mods (implicit+explicit attributes, plus explicit tier/level peaks)
-        f.update(extract_mod_attributes(row))
+        dps = derive_channel_dps(f)
+        f.update(dps)
 
-        # per-channel dps only; then drop aps & raw channels to avoid perfect collinearity
-        if compute_dps:
-            dps = derive_channel_dps(f)
-            f.update(dps)
-            for k in ("attack_speed", "phys_damage", "fire_damage", "cold_damage", "lightning_damage", "chaos_damage"):
-                f.pop(k, None)
+        for k in ("attack_speed", "rate_per_s",
+                  "phys_damage", "fire_damage", "cold_damage", "lightning_damage", "chaos_damage"):
+            f.pop(k, None)
 
         rows.append(f)
 
     features = pd.DataFrame(rows, index=df.index)
 
-    # ---- Optionality (continuous replacement for boolean constraints) ----
-    # helper booleans from raw df (NOT added to the feature set)
+    # ---- Optionality proxy using raw booleans on df (robust to missing cols) ----
     corrupted_s = df["corrupted"].astype(bool) if "corrupted" in df.columns else pd.Series(False, index=df.index)
     unmod_s = df["unmodifiable"].astype(bool) if "unmodifiable" in df.columns else pd.Series(False, index=df.index)
-    craftable = (~corrupted_s) & (~unmod_s)  # helper only
+    craftable = (~corrupted_s) & (~unmod_s)
 
-    # per-category cap95 of explicit_mod_count
     meta_cat = df["category"].astype(str) if "category" in df.columns else pd.Series("unknown", index=df.index)
     if "explicit_mod_count" not in features.columns:
-        features["explicit_mod_count"] = 0.0  # safety
+        features["explicit_mod_count"] = 0.0
 
     cap95_by_cat = (
         features.groupby(meta_cat)["explicit_mod_count"]
@@ -413,85 +513,32 @@ def make_item_features(
     open_slots_est = craftable.astype(float) * np.maximum(0.0, cap_map.values - features["explicit_mod_count"].values)
     features["open_slots_est"] = open_slots_est
 
-    # targets
+    # Targets
     targets = pd.DataFrame(index=df.index)
     targets["price"] = pd.to_numeric(df.get("price_amount_in_base", 0), errors="coerce").fillna(0.0)
     targets["log_price"] = np.log1p(targets["price"].clip(lower=0.0))
 
-    # metadata
+    # Metadata
     metadata = pd.DataFrame(index=df.index)
     for col in ["id", "league", "indexed", "rarity", "category", "base_type", "type_line", "name"]:
         if col in df.columns:
             metadata[col] = df[col].astype(str)
 
-    # numeric cleanup
     features.replace([np.inf, -np.inf], np.nan, inplace=True)
     features.fillna(0.0, inplace=True)
 
-    # ensure no total DPS columns sneak in from upstream
-    totals_to_drop = ["dps", "edps", "calc_edps", "calc_total_dps", "total_dps"]
+    totals_to_drop = ["dps", "edps", "calc_edps", "calc_total_dps", "total_dps", "pdps_aug"]
     features.drop(columns=[c for c in totals_to_drop if c in features.columns], inplace=True, errors="ignore")
 
-    # remove zero-variance columns
     var = features.var()
     zero_var = var[var <= 1e-12].index
     if len(zero_var) > 0:
         features.drop(columns=list(zero_var), inplace=True, errors="ignore")
 
+    if augment:
+        features = augment_features(features)
+
     return features, targets, metadata
-
-# -----------------------------------------------------------------------------
-# Category split helper (bottom-up per category; uniques as their own category)
-# -----------------------------------------------------------------------------
-def create_category_models(
-    features: pd.DataFrame,
-    targets: pd.DataFrame,
-    metadata: pd.DataFrame
-) -> Dict[str, Tuple[pd.DataFrame, pd.DataFrame]]:
-    models: Dict[str, Tuple[pd.DataFrame, pd.DataFrame]] = {}
-    if "category" not in metadata.columns:
-        return models
-
-    cats = metadata["category"].astype(str)
-    is_unique = (metadata.get("rarity", "").astype(str).str.lower() == "unique")
-
-    for cat in sorted(cats.dropna().unique()):
-        mask = (cats == cat)
-        if (mask & ~is_unique).any():
-            models[cat] = (features[mask & ~is_unique].copy(), targets[mask & ~is_unique].copy())
-        if (mask & is_unique).any():
-            names = metadata.loc[mask & is_unique, "type_line"].astype(str).dropna().unique()
-            for nm in names:
-                sel = mask & is_unique & (metadata["type_line"].astype(str) == nm)
-                if sel.sum() >= 5:
-                    models[f"unique_{nm}"] = (features[sel].copy(), targets[sel].copy())
-    return models
-
-# -----------------------------------------------------------------------------
-# IO
-# -----------------------------------------------------------------------------
-def load_and_process_item_data(
-    file_path: str | Path,
-    *,
-    base_path: Optional[str | Path] = None,
-    **feature_kwargs
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    path = Path(file_path).expanduser()
-    if not path.is_absolute():
-        root = Path(base_path).expanduser().resolve() if base_path else find_project_root()
-        path = (root / path).resolve()
-    if not path.exists():
-        raise FileNotFoundError(f"File not found: {path}")
-
-    try:
-        df = pd.read_parquet(path, engine="pyarrow")
-    except Exception:
-        try:
-            df = pd.read_parquet(path, engine="fastparquet")
-        except Exception as e:
-            raise RuntimeError(f"Failed to read parquet: {e}")
-
-    return make_item_features(df, **feature_kwargs)
 
 # -----------------------------------------------------------------------------
 # Validation
@@ -508,6 +555,7 @@ def validate_features(features: pd.DataFrame, targets: pd.DataFrame) -> None:
         "req_level", "req_str", "req_dex", "req_int",
         "implicit_mod_count", "explicit_mod_count",
         "other_mods_avg_value", "other_mods_avg_level",
+        "is_corrupted", "is_unmodifiable", "is_duplicated",
     ]
     print("\nkey features present:")
     for k in key_feats:
@@ -516,25 +564,33 @@ def validate_features(features: pd.DataFrame, targets: pd.DataFrame) -> None:
             mean_val = float(features.loc[features[k] != 0, k].mean()) if nz else 0.0
             print(f"  {k}: {nz} nonzero, avg={mean_val:.3f}")
 
-    # sanity: totals should be gone
     forbidden = {"dps", "edps", "calc_edps", "calc_total_dps", "total_dps"}
     present_forbidden = sorted([c for c in forbidden if c in features.columns])
     if present_forbidden:
         print(f"\nWARNING: drop totals to avoid multicollinearity: {present_forbidden}")
 
-# Example
-if __name__ == "__main__":
-    X, y, meta = load_and_process_item_data(
-        "training_data/overall/weapon_bow_overall_standard.parquet",
-        compute_dps=True,
-    )
-    validate_features(X, y)
-    buckets = create_category_models(X, y, meta)
-    print(f"\ncreated {len(buckets)} category models:")
-    for name, (fx, ty) in buckets.items():
-        print(f"  {name}: {len(fx)} rows")
+# -----------------------------------------------------------------------------
+# IO
+# -----------------------------------------------------------------------------
+def load_raw_table(file_path: str | Path, *, base_path: Optional[str | Path] = None) -> pd.DataFrame:
+    path = Path(file_path).expanduser()
+    if not path.is_absolute():
+        root = Path(base_path).expanduser().resolve() if base_path else find_project_root()
+        path = (root / path).resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"File not found: {path}")
+    try:
+        df = pd.read_parquet(path, engine="pyarrow")
+    except Exception:
+        try:
+            df = pd.read_parquet(path, engine="fastparquet")
+        except Exception as e:
+            raise RuntimeError(f"Failed to read parquet: {e}")
+    return df
 
-
+# -----------------------------------------------------------------------------
+# Splitters & bucket builders
+# -----------------------------------------------------------------------------
 def split_by_rarity(
     features: pd.DataFrame,
     targets: pd.DataFrame,
@@ -543,17 +599,11 @@ def split_by_rarity(
     copy: bool = True,
 ) -> Tuple[Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
            Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]]:
-    """
-    Split into craftables (Normal/Magic/Rare) vs Unique.
-    Returns: (craft_X, craft_y, craft_meta), (uniq_X, uniq_y, uniq_meta)
-    """
     if "rarity" in metadata.columns:
         rarity = metadata["rarity"].astype(str).str.lower()
         is_unique = rarity.eq("unique")
     else:
-        # if no rarity column, treat everything as craftable
         is_unique = pd.Series(False, index=metadata.index)
-
     is_craft = ~is_unique
 
     def pick(mask: pd.Series):
@@ -565,19 +615,98 @@ def split_by_rarity(
 
     return pick(is_craft), pick(is_unique)
 
+def create_craftable_category_buckets(
+    features: pd.DataFrame,
+    targets: pd.DataFrame,
+    metadata: pd.DataFrame,
+) -> Dict[str, Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]]:
+    out: Dict[str, Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]] = {}
+    if "category" not in metadata.columns:
+        return out
 
-def load_and_process_item_data_split(
+    rarity = metadata.get("rarity", "").astype(str).str.lower()
+    cats = metadata["category"].astype(str).fillna("unknown")
+
+    for cat in sorted(cats.unique()):
+        mask = (cats == cat) & (rarity != "unique")
+        if mask.any():
+            out[cat] = (
+                features.loc[mask].copy(),
+                targets.loc[mask].copy(),
+                metadata.loc[mask].copy(),
+            )
+    return out
+
+def create_unique_item_buckets(
+    features: pd.DataFrame,
+    targets: pd.DataFrame,
+    metadata: pd.DataFrame,
+) -> Dict[str, Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]]:
+    out: Dict[str, Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]] = {}
+    if "rarity" not in metadata.columns or "type_line" not in metadata.columns:
+        return out
+
+    rarity = metadata["rarity"].astype(str).str.lower()
+    type_line = metadata["type_line"].astype(str)
+
+    mask_u = rarity.eq("unique")
+    for nm in sorted(type_line[mask_u].dropna().unique()):
+        sel = mask_u & (type_line == nm)
+        if sel.any():
+            out[f"unique_{nm}"] = (
+                features.loc[sel].copy(),
+                targets.loc[sel].copy(),
+                metadata.loc[sel].copy(),
+            )
+    return out
+
+# -----------------------------------------------------------------------------
+# Simple one-call interface
+# -----------------------------------------------------------------------------
+def prepare_feature_sets_from_raw(
     file_path: str | Path,
     *,
     base_path: Optional[str | Path] = None,
-    **feature_kwargs
-) -> Tuple[Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
-           Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]]:
+    custom_hooks: Optional[List[Callable[[pd.Series, Dict[str, float]], None]]] = None,
+    augment: bool = True,
+) -> Dict[str, Any]:
     """
-    Convenience wrapper: run feature engineering, then split by rarity.
-    Returns: (craft_X, craft_y, craft_meta), (uniq_X, uniq_y, uniq_meta)
+    Returns:
+        {
+            "all": (X, y, meta),
+            "craft_all": (craft_X, craft_y, craft_meta),
+            "unique_all": (uniq_X, uniq_y, uniq_meta),
+            "craft_by_category": {cat: (Xc, yc, mc), ...},
+            "unique_by_item": {"unique_<type_line>": (Xu, yu, mu), ...},
+        }
     """
-    X, y, meta = load_and_process_item_data(
-        file_path, base_path=base_path, **feature_kwargs
+    df = load_raw_table(file_path, base_path=base_path)
+    X, y, meta = make_item_features(df, custom_hooks=custom_hooks, augment=augment)
+
+    (craft_X, craft_y, craft_meta), (uniq_X, uniq_y, uniq_meta) = split_by_rarity(X, y, meta)
+
+    craft_buckets = create_craftable_category_buckets(craft_X, craft_y, craft_meta)
+    unique_buckets = create_unique_item_buckets(uniq_X, uniq_y, uniq_meta)
+
+    return {
+        "all": (X, y, meta),
+        "craft_all": (craft_X, craft_y, craft_meta),
+        "unique_all": (uniq_X, uniq_y, uniq_meta),
+        "craft_by_category": craft_buckets,
+        "unique_by_item": unique_buckets,
+    }
+
+# -----------------------------------------------------------------------------
+# Example
+# -----------------------------------------------------------------------------
+if __name__ == "__main__":
+    res = prepare_feature_sets_from_raw(
+        "training_data/overall/weapon_bow_overall_standard.parquet",
+        augment=True,
     )
-    return split_by_rarity(X, y, meta)
+    Xc, yc, mc = res["craft_all"]
+    Xu, yu, mu = res["unique_all"]
+    print(f"Craftables: {len(Xc)} rows, {Xc.shape[1]} features")
+    print(f"Uniques   : {len(Xu)} rows, {Xu.shape[1]} features")
+    print(f"Craftable buckets: {len(res['craft_by_category'])}")
+    print(f"Unique buckets   : {len(res['unique_by_item'])}")

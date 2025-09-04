@@ -132,43 +132,60 @@ def get_correlated_features(X: pd.DataFrame, threshold: float = 0.8) -> pd.DataF
     return pd.DataFrame(pairs).sort_values('correlation', ascending=False)
 
 
-def remove_high_vif_features(X: pd.DataFrame, vif_threshold: float = 10.0, max_iterations: int = 10):
+def remove_high_vif_features(
+    X: pd.DataFrame,
+    vif_threshold: float = 10.0,
+    max_iterations: int = 100,
+    verbose: bool = True,
+) -> tuple[pd.DataFrame, list]:
     """
-    Iteratively remove features with highest VIF until all are below threshold.
-    
-    Parameters:
-    -----------
-    X : pd.DataFrame
-        Feature matrix
-    vif_threshold : float, default=10.0
-        VIF threshold
-    max_iterations : int, default=10
-        Maximum iterations to prevent infinite loops
-    
-    Returns:
-    --------
-    tuple[pd.DataFrame, list]
-        - Cleaned feature matrix
-        - List of removed features
+    Iteratively remove the single feature with the highest VIF (> threshold),
+    recomputing VIF after each removal, until max VIF <= threshold or we hit
+    max_iterations.
+
+    Returns
+    -------
+    (X_clean, removed_features)
+        X_clean : pd.DataFrame with remaining features
+        removed_features : list of (feature_name, vif_at_removal)
     """
     X_clean = X.copy()
-    removed_features = []
-    
-    for iteration in range(max_iterations):
-        vif_df, analysis = compute_vif(X_clean, vif_threshold=vif_threshold, verbose=False)
-        
-        if not analysis['multicollinearity_detected']:
-            print(f"Converged after {iteration} iterations")
+    removed_features: list[tuple[str, float]] = []
+
+    for it in range(1, max_iterations + 1):
+        vif_df, _ = compute_vif(X_clean, vif_threshold=vif_threshold, verbose=False)
+        if vif_df.empty or X_clean.shape[1] <= 1:
+            if verbose:
+                print("No VIF computable (empty or single-feature matrix).")
             break
-        
-        # Remove feature with highest VIF
-        highest_vif_feature = vif_df.iloc[0]['feature']
-        highest_vif_value = vif_df.iloc[0]['VIF']
-        
-        X_clean = X_clean.drop(columns=[highest_vif_feature])
-        removed_features.append((highest_vif_feature, highest_vif_value))
-        
-        print(f"Iteration {iteration + 1}: Removed {highest_vif_feature} (VIF: {highest_vif_value:.2f})")
-    
-    print(f"\nFinal result: {X_clean.shape[1]} features remaining, {len(removed_features)} removed")
+
+        # treat inf as very large so they get dropped first
+        work = vif_df.copy()
+        work["VIF_cmp"] = work["VIF"].replace([np.inf, -np.inf], np.inf)
+
+        # features strictly above threshold
+        over = work[work["VIF_cmp"] > vif_threshold]
+        if over.empty:
+            if verbose:
+                max_v = float(work["VIF_cmp"].max())
+                print(f"Converged after {it-1} iterations (max VIF = {max_v:.2f} ≤ {vif_threshold}).")
+            break
+
+        # drop the worst offender this round
+        drop_row = over.sort_values("VIF_cmp", ascending=False).iloc[0]
+        feat_to_drop = str(drop_row["feature"])
+        vif_to_drop = float(drop_row["VIF"])
+
+        X_clean = X_clean.drop(columns=[feat_to_drop])
+        removed_features.append((feat_to_drop, vif_to_drop))
+
+        if verbose:
+            print(f"Iteration {it}: removed '{feat_to_drop}' (VIF={vif_to_drop:.2f}); "
+                  f"{X_clean.shape[1]} features remain.")
+
+    if verbose:
+        final_vif, _ = compute_vif(X_clean, vif_threshold=vif_threshold, verbose=False)
+        if not final_vif.empty:
+            print(f"Final max VIF: {final_vif['VIF'].max():.2f}")
+
     return X_clean, removed_features
