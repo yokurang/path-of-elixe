@@ -30,8 +30,8 @@ import aiohttp
 from src.recorder.constants import CATEGORIES
 
 # ---- Import your existing pipeline bits
-from take_home_project_poe.misc.poe2_currency_recorder_web_scrape import get_currency_cache, Server
-from take_home_project_poe.misc.market_item_listener_bak import ( 
+from src.recorder.poe_currency_recorder import get_currency_cache, Server
+from src.recorder.poe_trade2_recorder import ( 
     setup_logging,
     options_from_config,
     headers_from_config,
@@ -208,7 +208,7 @@ async def _search_once_with_cfg(
             "No FX cache provided; fetching live | base_currency=%s base_server=%s realm=%s league=%s",
             opts["base_currency"], opts["base_server"].value, opts["realm"], opts["league"]
         )
-        from take_home_project_poe.misc.poe2_currency_recorder_web_scrape import get_currency_cache as _get_cc
+        from src.recorder.poe_currency_recorder import get_currency_cache as _get_cc
         fx_cache = _get_cc([opts["base_server"]], log_level=log_level)
         converter = PriceConverter(fx_cache, opts["base_server"], opts["base_currency"])
     else:

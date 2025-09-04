@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List, Tuple, Any, Optional
+from typing import Dict, List, Tuple, Any, Optional, Iterable
 import math
 import re
 import json
@@ -12,17 +12,45 @@ import numpy as np
 from utils import find_project_root
 
 # -----------------------------------------------------------------------------
-# Constants and Regexes
+# Regex & constants
 # -----------------------------------------------------------------------------
 RANGE_RE = re.compile(r"^\s*(-?\d+(?:\.\d+)?)\s*[-–]\s*(-?\d+(?:\.\d+)?)\s*$")
 PERCENT_RE = re.compile(r"(-?\d+(?:\.\d+)?)\s*%")
 NUM_RE = re.compile(r"-?\d+(?:\.\d+)?")
+TIER_NUM_RE = re.compile(r"^\s*[SPsp]?(\d+)\s*$")  # "S10" / "P4" -> "10" / "4"
+
+# Known hashes you may want explicitly (extend as needed)
+IMPORTANT_MOD_HASHES = {
+    "stat_3489782002": "max_energy_shield",
+    "stat_803737631": "accuracy",
+    "stat_2482852589": "increased_energy_shield_pct",
+    "stat_3299347043": "max_life",
+    "stat_3917489142": "item_rarity_pct",
+    "stat_3261801346": "dexterity",
+    "stat_4080418644": "strength",
+    "stat_1050105434": "max_mana",
+    "stat_587431675": "critical_chance_pct",
+    "stat_3336890334": "lightning_damage",
+    "stat_709508406": "fire_damage",
+    "stat_3885405204": "skill_level",
+    "stat_1028592286": "spirit",
+    "stat_691932474": "accuracy_rating",
+    "stat_1509134228": "physical_damage_pct",
+    "stat_3695891184": "attack_speed_pct",
+    "stat_821021828": "life_on_kill",
+    "stat_1263695895": "light_radius",
+    "stat_55876295": "life_leech",
+    "stat_669069897": "mana_leech",
+    "stat_2694482655": "increased_damage",
+    "stat_3639275092": "reduced_requirements",
+}
+
+LEVEL_KEYWORDS = ["lightning", "fire", "cold", "chaos", "bow", "spell"]
 
 # -----------------------------------------------------------------------------
-# Utility Functions
+# Utils
 # -----------------------------------------------------------------------------
 def _to_float(x: Any) -> float:
-    """Convert to float with fallback to NaN."""
     try:
         if x is None or (isinstance(x, float) and math.isnan(x)):
             return np.nan
@@ -31,7 +59,6 @@ def _to_float(x: Any) -> float:
         return np.nan
 
 def _safe_parse_json(x: Any) -> Any:
-    """Parse JSON strings; return original value if parsing fails."""
     if isinstance(x, str):
         try:
             return json.loads(x)
@@ -39,14 +66,12 @@ def _safe_parse_json(x: Any) -> Any:
             return x
     return x
 
-def _normalize_text(s: str) -> str:
-    """Normalize text by removing PoE markup and standardizing whitespace."""
+def _normalize_text(s: Any) -> str:
     s = re.sub(r"[\[\]\|]", "", str(s))
     s = re.sub(r"\s+", " ", s).strip()
     return s.lower()
 
 def _extract_property_value(values: Any) -> Optional[str]:
-    """Extract value from PoE property values structure like [['31-47', 0]]."""
     if isinstance(values, list) and values:
         first = values[0]
         if isinstance(first, list) and first:
@@ -54,559 +79,505 @@ def _extract_property_value(values: Any) -> Optional[str]:
         return str(first)
     return None
 
-def _parse_numeric_range(s: Any) -> Tuple[float, float, float]:
+def _parse_numeric_avg(text: Any) -> float:
+    if text is None:
+        return 0.0
+    s = str(text).strip()
+    m = RANGE_RE.match(s)
+    if m:
+        lo = _to_float(m.group(1)); hi = _to_float(m.group(2))
+        if math.isnan(lo) or math.isnan(hi):
+            return 0.0
+        return (lo + hi) / 2.0
+    m = PERCENT_RE.search(s)
+    if m:
+        v = _to_float(m.group(1))
+        return 0.0 if math.isnan(v) else v  # leave as "percent units"; caller can rescale
+    m = NUM_RE.search(s)
+    if m:
+        v = _to_float(m.group(0))
+        return 0.0 if math.isnan(v) else v
+    return 0.0
+
+def _avg_or_first_number(text: str) -> float:
+    m = RANGE_RE.search(text)
+    if m:
+        lo = _to_float(m.group(1)); hi = _to_float(m.group(2))
+        if not math.isnan(lo) and not math.isnan(hi):
+            return (lo + hi) / 2.0
+    nums = [ _to_float(n) for n in NUM_RE.findall(text) ]
+    nums = [n for n in nums if not math.isnan(n)]
+    return float(nums[0]) if nums else 0.0
+
+def _coalesce_extended(raw_ext: Any) -> List[dict]:
     """
-    Parse numeric ranges, percentages, or single values.
-    Returns (min, max, average).
-    Percentages are converted to fractions (e.g., 5% -> 0.05).
+    Normalize 'extended' into a list[dict]. Handles dict, json string,
+    list of json strings, or list of dicts.
     """
-    if s is None:
-        return (np.nan, np.nan, np.nan)
-    
-    text = str(s).strip()
-    
-    # Try range pattern first (e.g., "31-47")
-    range_match = RANGE_RE.match(text)
-    if range_match:
-        min_val = _to_float(range_match.group(1))
-        max_val = _to_float(range_match.group(2))
-        avg_val = (min_val + max_val) / 2.0
-        return (min_val, max_val, avg_val)
-    
-    # Try percentage pattern (e.g., "5.00%")
-    percent_match = PERCENT_RE.search(text)
-    if percent_match:
-        val = _to_float(percent_match.group(1)) / 100.0
-        return (val, val, val)
-    
-    # Try single number
-    num_match = NUM_RE.search(text)
-    if num_match:
-        val = _to_float(num_match.group(0))
-        return (val, val, val)
-    
-    return (np.nan, np.nan, np.nan)
+    ext = raw_ext
+    if isinstance(ext, str):
+        ext = _safe_parse_json(ext)
+    if isinstance(ext, dict):
+        return [ext]
+    if isinstance(ext, list):
+        out: List[dict] = []
+        for item in ext:
+            if isinstance(item, str):
+                obj = _safe_parse_json(item)
+                if isinstance(obj, dict):
+                    out.append(obj)
+            elif isinstance(item, dict):
+                out.append(item)
+        return out
+    return []
 
 # -----------------------------------------------------------------------------
-# Property Extractors
+# Extractors
 # -----------------------------------------------------------------------------
-def _extract_weapon_properties(properties: Any) -> Dict[str, float]:
-    """Extract damage, crit chance, and APS from weapon properties."""
-    result = {}
-    properties = _safe_parse_json(properties)
-    
-    if not isinstance(properties, list):
-        return result
-    
-    def _normalize_prop_name(name: str) -> str:
-        name = _normalize_text(name)
-        # Standardize critical hit chance naming
-        return name.replace("critical hit chance", "critical chance")
-    
-    for prop in properties:
-        if not isinstance(prop, dict):
-            continue
-            
-        prop_name = _normalize_prop_name(prop.get("name", ""))
-        values = prop.get("values", [])
-        value_text = _extract_property_value(values)
-        
-        if "physical damage" in prop_name:
-            min_val, max_val, avg_val = _parse_numeric_range(value_text)
-            result.update({
-                "phys_min": min_val, "phys_max": max_val, "phys_avg": avg_val
-            })
-        elif "chaos damage" in prop_name:
-            min_val, max_val, avg_val = _parse_numeric_range(value_text)
-            result.update({
-                "chaos_min": min_val, "chaos_max": max_val, "chaos_avg": avg_val
-            })
-        elif "cold damage" in prop_name:
-            min_val, max_val, avg_val = _parse_numeric_range(value_text)
-            result.update({
-                "cold_min": min_val, "cold_max": max_val, "cold_avg": avg_val
-            })
-        elif "fire damage" in prop_name:
-            min_val, max_val, avg_val = _parse_numeric_range(value_text)
-            result.update({
-                "fire_min": min_val, "fire_max": max_val, "fire_avg": avg_val
-            })
-        elif "lightning damage" in prop_name:
-            min_val, max_val, avg_val = _parse_numeric_range(value_text)
-            result.update({
-                "lightning_min": min_val, "lightning_max": max_val, "lightning_avg": avg_val
-            })
-        elif "critical chance" in prop_name:
-            _, _, result["crit_chance"] = _parse_numeric_range(value_text)
-        elif "attacks per second" in prop_name:
-            _, _, result["aps"] = _parse_numeric_range(value_text)
-        elif "quality" in prop_name:
-            _, _, result["quality"] = _parse_numeric_range(value_text)
-        elif "spirit" in prop_name:
-            _, _, result["spirit"] = _parse_numeric_range(value_text)
-    
-    return result
+def extract_base_attributes(row: pd.Series) -> Dict[str, float]:
+    """
+    NOTE: We intentionally avoid emitting boolean flags as features.
+    Only continuous basics here.
+    """
+    a: Dict[str, float] = {}
+    a["ilvl"] = _to_float(row.get("ilvl", 0))
+    sockets = _safe_parse_json(row.get("sockets", []))
+    a["socket_count"] = float(len(sockets)) if isinstance(sockets, list) else 0.0
+    return a
 
-def _extract_requirements(requirements: Any) -> Dict[str, float]:
-    """Extract level and attribute requirements."""
-    result = {
-        "req_level": np.nan, "req_str": np.nan, 
-        "req_dex": np.nan, "req_int": np.nan
-    }
-    
-    requirements = _safe_parse_json(requirements)
-    if not isinstance(requirements, list):
-        return result
-    
-    def _find_requirement_by_suffix(suffix: str) -> Optional[float]:
-        for req in requirements:
+def extract_requirements(row: pd.Series) -> Dict[str, float]:
+    out: Dict[str, float] = {"req_level": 0.0, "req_str": 0.0, "req_dex": 0.0, "req_int": 0.0}
+    reqs = _safe_parse_json(row.get("requirements", row.get("weapon_requirements", [])))
+    if isinstance(reqs, list):
+        for req in reqs:
             if not isinstance(req, dict):
                 continue
             name = _normalize_text(req.get("name", ""))
-            if name.endswith(suffix):
-                value_text = _extract_property_value(req.get("values", []))
-                return _parse_numeric_range(value_text)[2]  # Return average
-        return None
-    
-    # Map requirement types to their possible name suffixes
-    req_mappings = [
-        ("req_level", ["level"]),
-        ("req_str", ["strength", "str"]),
-        ("req_dex", ["dexterity", "dex"]),
-        ("req_int", ["intelligence", "int"]),
-    ]
-    
-    for req_key, suffixes in req_mappings:
-        for suffix in suffixes:
-            value = _find_requirement_by_suffix(suffix)
-            if value is not None:
-                result[req_key] = value
-                break
-    
-    return result
+            val = _parse_numeric_avg(_extract_property_value(req.get("values", [])))
+            if "level" in name:
+                out["req_level"] = val
+            elif name.endswith("strength") or name.endswith("str"):
+                out["req_str"] = val
+            elif name.endswith("dexterity") or name.endswith("dex"):
+                out["req_dex"] = val
+            elif name.endswith("intelligence") or name.endswith("int"):
+                out["req_int"] = val
+    return out
 
-def _extract_socket_info(sockets: Any) -> Tuple[int, int]:
-    """Extract total sockets and rune sockets count."""
-    sockets = _safe_parse_json(sockets)
-    if not isinstance(sockets, list):
-        return (0, 0)
-    
-    total_sockets = len(sockets)
-    rune_sockets = 0
-    
-    for socket in sockets:
-        if isinstance(socket, dict):
-            socket_type = str(socket.get("type", "")).lower()
-        elif isinstance(socket, str):
-            socket_type = socket.lower()
-        else:
-            continue
-            
-        if socket_type == "rune":
-            rune_sockets += 1
-    
-    return (total_sockets, rune_sockets)
+def extract_weapon_properties(row: pd.Series) -> Dict[str, float]:
+    props: Dict[str, float] = {}
+    arr = _safe_parse_json(row.get("properties", []))
+    if isinstance(arr, list):
+        for prop in arr:
+            if not isinstance(prop, dict):
+                continue
+            name = _normalize_text(prop.get("name", ""))
+            val = _parse_numeric_avg(_extract_property_value(prop.get("values", [])))
+            if "physical damage" in name:
+                props["phys_damage"] = val
+            elif "chaos damage" in name:
+                props["chaos_damage"] = val
+            elif "cold damage" in name:
+                props["cold_damage"] = val
+            elif "fire damage" in name:
+                props["fire_damage"] = val
+            elif "lightning damage" in name:
+                props["lightning_damage"] = val
+            elif "critical" in name and "chance" in name:
+                props["crit_chance"] = val
+            elif "attacks per second" in name:
+                props["attack_speed"] = val
+            elif "quality" in name:
+                props["quality"] = val
+            elif "armor" in name or "armour" in name:
+                props["armor"] = val
+            elif "evasion" in name:
+                props["evasion"] = val
+            elif "energy shield" in name:
+                props["energy_shield"] = val
+    return props
 
-def _extract_extended_stats(extended: Any) -> Dict[str, float]:
-    """Extract DPS and augmentation stats from extended field."""
-    result = {
-        "dps": np.nan, "pdps": np.nan, "edps": np.nan,
-        "dps_aug": 0.0, "pdps_aug": 0.0, "edps_aug": 0.0,
+# -----------------------------------------------------------------------------
+# Mods (implicit & explicit treated as attributes)
+# -----------------------------------------------------------------------------
+def extract_mod_attributes(row: pd.Series) -> Dict[str, float]:
+    out: Dict[str, float] = {
+        "implicit_mod_count": 0.0,
+        "explicit_mod_count": 0.0,
+        # recognized aggregates
+        "mod_add_fire_avg": 0.0,
+        "mod_add_cold_avg": 0.0,
+        "mod_add_lightning_avg": 0.0,
+        "mod_add_chaos_avg": 0.0,
+        "mod_inc_attack_speed_pct": 0.0,  # fraction (0.12 = 12%)
+        "mod_inc_crit_chance_pct": 0.0,
+        "mod_inc_phys_pct": 0.0,
+        "mod_accuracy": 0.0,
+        # “others” buckets
+        "other_mods_avg_value": 0.0,
+        "other_mods_avg_level": 0.0,
+        "other_mods_count": 0.0,
+        # highest explicit peaks
+        "highest_explicit_tier_num": 0.0,
+        "highest_explicit_level": 0.0,
     }
-    
-    extended = _safe_parse_json(extended)
-    if not isinstance(extended, dict):
-        return result
-    
-    # Extract DPS values
-    for stat in ("dps", "pdps", "edps"):
-        if stat in extended:
-            result[stat] = _to_float(extended[stat])
-    
-    # Extract augmentation flags
-    for key, value in extended.items():
-        if isinstance(key, str) and key.endswith("_aug"):
-            result[key] = 1.0 if bool(value) else 0.0
-    
-    # Extract other numeric fields (excluding complex nested structures)
-    excluded_keys = {"mods", "hashes"}
-    for key, value in extended.items():
-        if key in result or key in excluded_keys:
-            continue
-        numeric_val = _to_float(value)
-        if not math.isnan(numeric_val):
-            result[key] = numeric_val
-    
-    return result
+    for kw in LEVEL_KEYWORDS:
+        out[f"mod_plus_levels_{kw}"] = 0.0
 
-def _extract_mod_features(implicit_mods: Any, explicit_mods: Any, extended: Any) -> Dict[str, float]:
-    """Extract mod count and key mod presence flags."""
-    result = {
-        "n_implicit_mods": 0.0,
-        "n_explicit_mods": 0.0,
-        "has_added_fire": 0.0,
-        "has_added_cold": 0.0,
-        "has_added_lightning": 0.0,
-        "has_added_chaos": 0.0,
-        "has_inc_phys_pct": 0.0,
-        "has_inc_attack_speed_pct": 0.0,
-        "has_inc_crit_chance_pct": 0.0,
-        "has_accuracy": 0.0,
-    }
-    
-    def _extract_mod_names(mods: Any) -> List[str]:
-        mods = _safe_parse_json(mods)
-        mod_names = []
-        
-        if isinstance(mods, list):
-            for mod in mods:
-                if isinstance(mod, dict) and "name" in mod:
-                    mod_names.append(_normalize_text(mod["name"]))
+    other_vals: List[float] = []
+    other_lvls: List[float] = []
+
+    ext_list = _coalesce_extended(row.get("extended", {}))
+    all_implicit: List[dict] = []
+    all_explicit: List[dict] = []
+
+    for ext in ext_list:
+        mods = ext.get("mods", {})
+        if isinstance(mods, dict):
+            impl = mods.get("implicit", []) or []
+            expl = mods.get("explicit", []) or []
+            if isinstance(impl, list):
+                all_implicit.extend([m for m in impl if isinstance(m, dict)])
+            if isinstance(expl, list):
+                all_explicit.extend([m for m in expl if isinstance(m, dict)])
+
+    out["implicit_mod_count"] = float(len(all_implicit))
+    out["explicit_mod_count"] = float(len(all_explicit))
+
+    # explicit tier/level peaks
+    max_tier_num = 0.0
+    max_level = 0.0
+    for m in all_explicit:
+        tier = str(m.get("tier", "") or "")
+        mlevel = _to_float(m.get("level", 0)) or 0.0
+        mtm = TIER_NUM_RE.match(tier)
+        if mtm:
+            tnum = _to_float(mtm.group(1))
+            if not math.isnan(tnum):
+                max_tier_num = max(max_tier_num, float(tnum))
+        max_level = max(max_level, float(mlevel))
+    out["highest_explicit_tier_num"] = float(max_tier_num)
+    out["highest_explicit_level"] = float(max_level)
+
+    def consume_mod_line(mod: dict):
+        nonlocal other_vals, other_lvls
+        name = _normalize_text(mod.get("name", ""))
+        level = _to_float(mod.get("level", 1)) or 1.0
+        mags = mod.get("magnitudes", [])
+        used_structured = False
+
+        if isinstance(mags, list) and mags:
+            for mag in mags:
+                if not isinstance(mag, dict):
+                    continue
+                h = str(mag.get("hash", "")).replace("implicit.", "").replace("explicit.", "")
+                lo = _to_float(mag.get("min", 0)); hi = _to_float(mag.get("max", 0))
+                v = (lo + hi) / 2.0 if (not math.isnan(lo) and not math.isnan(hi)) else 0.0
+
+                if h in IMPORTANT_MOD_HASHES:
+                    k = IMPORTANT_MOD_HASHES[h]
+                    out[k] = out.get(k, 0.0) + v
+                    used_structured = True
                 else:
-                    mod_names.append(_normalize_text(str(mod)))
-        
-        return mod_names
-    
-    # Extract mod names
-    implicit_names = _extract_mod_names(implicit_mods)
-    explicit_names = _extract_mod_names(explicit_mods)
-    
-    # Try to get mods from extended if primary sources are empty
-    extended_data = _safe_parse_json(extended)
-    if isinstance(extended_data, dict) and "mods" in extended_data:
-        mods_data = extended_data["mods"]
-        if isinstance(mods_data, dict):
-            if not implicit_names and "implicit" in mods_data:
-                implicit_names = _extract_mod_names(mods_data["implicit"])
-            if not explicit_names and "explicit" in mods_data:
-                explicit_names = _extract_mod_names(mods_data["explicit"])
-    
-    result["n_implicit_mods"] = float(len(implicit_names))
-    result["n_explicit_mods"] = float(len(explicit_names))
-    
-    # Check for specific mod types
-    all_mod_names = implicit_names + explicit_names
-    for mod_name in all_mod_names:
-        if "adds" in mod_name and "fire" in mod_name:
-            result["has_added_fire"] = 1.0
-        if "adds" in mod_name and "cold" in mod_name:
-            result["has_added_cold"] = 1.0
-        if "adds" in mod_name and "lightning" in mod_name:
-            result["has_added_lightning"] = 1.0
-        if "adds" in mod_name and "chaos" in mod_name:
-            result["has_added_chaos"] = 1.0
-        if "% increased" in mod_name and "physical" in mod_name:
-            result["has_inc_phys_pct"] = 1.0
-        if "% increased" in mod_name and "attack speed" in mod_name:
-            result["has_inc_attack_speed_pct"] = 1.0
-        if "% increased" in mod_name and ("critical chance" in mod_name or "critical strike chance" in mod_name):
-            result["has_inc_crit_chance_pct"] = 1.0
-        if "accuracy" in mod_name:
-            result["has_accuracy"] = 1.0
-    
-    return result
+                    if v != 0.0:
+                        other_vals.append(v)
+                        other_lvls.append(level)
+                        used_structured = True
+
+        if not used_structured and name:
+            # adds X-Y elemental
+            if "adds" in name and "damage" in name:
+                if "fire" in name:
+                    out["mod_add_fire_avg"] += _avg_or_first_number(name); return
+                if "cold" in name:
+                    out["mod_add_cold_avg"] += _avg_or_first_number(name); return
+                if "lightning" in name:
+                    out["mod_add_lightning_avg"] += _avg_or_first_number(name); return
+                if "chaos" in name:
+                    out["mod_add_chaos_avg"] += _avg_or_first_number(name); return
+
+            # % increases
+            if "attack speed" in name and "%" in name:
+                m = PERCENT_RE.search(name)
+                if m: out["mod_inc_attack_speed_pct"] += (_to_float(m.group(1)) / 100.0); return
+            if ("critical chance" in name or "critical strike chance" in name) and "%" in name:
+                m = PERCENT_RE.search(name)
+                if m: out["mod_inc_crit_chance_pct"] += (_to_float(m.group(1)) / 100.0); return
+            if "physical" in name and "damage" in name and "% increased" in name:
+                m = PERCENT_RE.search(name)
+                if m: out["mod_inc_phys_pct"] += (_to_float(m.group(1)) / 100.0); return
+
+            # accuracy
+            if "accuracy" in name:
+                out["mod_accuracy"] += _avg_or_first_number(name); return
+
+            # +X to level of ...
+            if "to level" in name:
+                lvl_val = _avg_or_first_number(name)
+                for kw in LEVEL_KEYWORDS:
+                    if kw in name:
+                        out[f"mod_plus_levels_{kw}"] += lvl_val
+                        return
+
+            # fallback → others
+            v = _avg_or_first_number(name)
+            if v != 0.0:
+                other_vals.append(v); other_lvls.append(level)
+
+    for m in all_implicit:
+        consume_mod_line(m)
+    for m in all_explicit:
+        consume_mod_line(m)
+
+    if other_vals:
+        out["other_mods_avg_value"] = float(np.mean(other_vals))
+        out["other_mods_avg_level"] = float(np.mean(other_lvls)) if other_lvls else 0.0
+        out["other_mods_count"] = float(len(other_vals))
+
+    return out
 
 # -----------------------------------------------------------------------------
-# DPS Computation
+# Per-channel DPS only (no totals to avoid multicollinearity)
 # -----------------------------------------------------------------------------
-def _compute_channel_dps(features: pd.DataFrame) -> pd.DataFrame:
-    """Compute DPS for each damage channel using DPS = APS × average_damage."""
-    result = features.copy()
-    
-    def _safe_numeric(col: str) -> pd.Series:
-        return pd.to_numeric(result.get(col, 0.0), errors="coerce").fillna(0.0)
-    
-    aps = _safe_numeric("aps")
-    
-    # Compute per-channel DPS
-    result["pdps"] = aps * _safe_numeric("phys_avg")
-    result["fdps"] = aps * _safe_numeric("fire_avg")
-    result["cdps"] = aps * _safe_numeric("cold_avg")
-    result["ldps"] = aps * _safe_numeric("lightning_avg")
-    result["chaos_dps"] = aps * _safe_numeric("chaos_avg")
-    
-    return result
+def derive_channel_dps(feats: Dict[str, float]) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    aps = feats.get("attack_speed", 0.0) or 0.0
+
+    def d(name: str) -> float:
+        return float(feats.get(name, 0.0) or 0.0)
+
+    if aps > 0:
+        out["pdps"] = aps * d("phys_damage")
+        out["fdps"] = aps * d("fire_damage")
+        out["cdps"] = aps * d("cold_damage")
+        out["ldps"] = aps * d("lightning_damage")
+        out["chaos_dps"] = aps * d("chaos_damage")
+    else:
+        out["pdps"] = out["fdps"] = out["cdps"] = out["ldps"] = out["chaos_dps"] = 0.0
+    return out
 
 # -----------------------------------------------------------------------------
-# Feature Engineering Helpers
+# Main feature engineering
 # -----------------------------------------------------------------------------
-def _safe_drop_columns(df: pd.DataFrame, columns: List[str]) -> pd.DataFrame:
-    """Drop columns that exist in the dataframe."""
-    existing_cols = [col for col in columns if col in df.columns]
-    return df.drop(columns=existing_cols) if existing_cols else df
-
-def _create_count_dummies(
-    series: pd.Series,
-    prefix: str,
-    drop_first: bool = True,
-    max_value: Optional[int] = None
-) -> pd.DataFrame:
-    """Create one-hot encoding for count data with optional clipping."""
-    numeric_series = pd.to_numeric(series, errors="coerce").fillna(0).astype(int)
-    
-    if max_value is not None:
-        numeric_series = numeric_series.clip(lower=0, upper=max_value)
-    
-    dummies = pd.get_dummies(numeric_series, prefix=prefix)
-    
-    if drop_first and len(dummies.columns) > 1:
-        # Drop the smallest category (typically 0) as baseline
-        baseline_col = dummies.columns.sort_values()[0]
-        dummies = dummies.drop(columns=baseline_col)
-    
-    return dummies.astype(float)
-
-# -----------------------------------------------------------------------------
-# Main Feature Engineering Function
-# -----------------------------------------------------------------------------
-def make_weapon_features(
+def make_item_features(
     df: pd.DataFrame,
-    *,
-    one_hot_rarity: bool = True,
-    drop_raw_damage: bool = True,
-    drop_aps: bool = True,
-    drop_extended_dps: bool = True,
-    keep_mod_flags: bool = False,
-    sockets_one_hot: bool = True,
-    sockets_max_cap: int = 6,
+    compute_dps: bool = True,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """
-    Transform PoE2 weapon data into ML features.
-    
-    Args:
-        df: Raw weapon data DataFrame
-        one_hot_rarity: Create rarity dummy variables
-        drop_raw_damage: Remove min/max/avg damage columns after computing DPS
-        drop_aps: Remove attacks per second (redundant with DPS)
-        drop_extended_dps: Remove precomputed DPS from extended stats
-        keep_mod_flags: Keep has_* mod indicator flags
-        sockets_one_hot: One-hot encode socket counts
-        sockets_max_cap: Maximum sockets for one-hot encoding
-    
-    Returns:
-        Tuple of (features, targets, metadata) DataFrames
-    """
     if df.empty:
         raise ValueError("Input DataFrame is empty")
-    
-    # Initialize result DataFrames
-    features = pd.DataFrame(index=df.index)
-    targets = pd.DataFrame(index=df.index)
-    metadata = pd.DataFrame(index=df.index)
-    
-    # --- Extract Targets ---
-    targets["price_in_base"] = pd.to_numeric(
-        df.get("price_amount_in_base", np.nan), errors="coerce"
-    )
-    targets["log_price"] = np.log1p(targets["price_in_base"].clip(lower=0))
-    
-    # --- Extract Metadata ---
-    meta_columns = [
-        "id", "league", "indexed", "rarity", "category", 
-        "base_type", "type_line", "ilvl"
-    ]
-    for col in meta_columns:
-        if col in df.columns:
-            metadata[col] = df[col]
-    
-    # --- Extract Basic Features ---
-    features["ilvl"] = pd.to_numeric(df.get("ilvl", np.nan), errors="coerce")
-    
-    # Boolean flags as numeric
-    boolean_cols = ["verified", "identified", "corrupted", "duplicated", "unmodifiable", "support"]
-    for col in boolean_cols:
-        if col in df.columns:
-            features[col] = df[col].astype(bool).astype(float)
-    
-    # --- Socket Features ---
-    socket_data = df.get("sockets", [None] * len(df))
-    socket_counts = [_extract_socket_info(sockets) for sockets in socket_data]
-    total_sockets, rune_sockets = zip(*socket_counts)
-    
-    features["n_sockets"] = list(total_sockets)
-    features["n_rune_sockets"] = list(rune_sockets)
-    
-    if sockets_one_hot:
-        socket_dummies = _create_count_dummies(
-            features["n_sockets"], 
-            prefix="sockets", 
-            drop_first=True, 
-            max_value=sockets_max_cap
-        )
-        features = pd.concat([features, socket_dummies], axis=1)
-        features = _safe_drop_columns(features, ["n_sockets"])
-    
-    # Always drop redundant rune socket features
-    features = _safe_drop_columns(features, ["n_rune_sockets"])
-    
-    # --- Requirement Features ---
-    req_source = df.get("requirements", df.get("weapon_requirements", [None] * len(df)))
-    req_data = [_extract_requirements(reqs) for reqs in req_source]
-    req_df = pd.DataFrame(req_data, index=df.index)
-    
-    # Derive primary requirement as max of str/dex/int
-    stat_reqs = req_df[["req_str", "req_dex", "req_int"]]
-    req_df["req_primary"] = stat_reqs.max(axis=1, skipna=True)
-    
-    # Add primary requirement only
-    features["req_primary"] = req_df["req_primary"]
-    
-    # --- Weapon Property Features ---
-    property_data = [_extract_weapon_properties(props) for props in df.get("properties", [None] * len(df))]
-    prop_df = pd.DataFrame(property_data, index=df.index)
-    features = pd.concat([features, prop_df], axis=1)
-    
-    # --- Extended Stats ---
-    extended_data = [_extract_extended_stats(ext) for ext in df.get("extended", [None] * len(df))]
-    ext_df = pd.DataFrame(extended_data, index=df.index)
-    features = pd.concat([features, ext_df], axis=1)
-    
-    # Consolidate augmentation flags
-    aug_columns = [col for col in features.columns if col.endswith("_aug")]
-    if aug_columns:
-        features["has_augmentation"] = (features[aug_columns].max(axis=1) > 0).astype(float)
-        features = _safe_drop_columns(features, aug_columns)
-    
-    if drop_extended_dps:
-        features = _safe_drop_columns(features, ["dps", "pdps", "edps"])
-    
-    # --- Mod Features ---
-    mod_data = [
-        _extract_mod_features(impl, expl, ext) 
-        for impl, expl, ext in zip(
-            df.get("implicit_mods", [None] * len(df)),
-            df.get("explicit_mods", [None] * len(df)),
-            df.get("extended", [None] * len(df))
-        )
-    ]
-    mod_df = pd.DataFrame(mod_data, index=df.index)
-    features = pd.concat([features, mod_df], axis=1)
-    
-    if not keep_mod_flags:
-        has_columns = [col for col in features.columns if col.startswith("has_")]
-        features = _safe_drop_columns(features, has_columns)
-    
-    # --- Compute Per-Channel DPS ---
-    features = _compute_channel_dps(features)
-    
-    # --- Cleanup Raw Damage Columns ---
-    if drop_raw_damage:
-        damage_columns = [
-            "phys_min", "phys_max", "phys_avg",
-            "fire_min", "fire_max", "fire_avg", 
-            "cold_min", "cold_max", "cold_avg",
-            "lightning_min", "lightning_max", "lightning_avg",
-            "chaos_min", "chaos_max", "chaos_avg",
-        ]
-        features = _safe_drop_columns(features, damage_columns)
-    
-    if drop_aps:
-        features = _safe_drop_columns(features, ["aps"])
-    
-    # --- Rarity One-Hot Encoding ---
-    if one_hot_rarity:
-        rarity_series = df.get("rarity", "unknown").fillna("unknown").astype(str).str.lower()
-        rarity_dummies = pd.get_dummies(rarity_series, prefix="rarity")
-        features = pd.concat([features, rarity_dummies], axis=1)
-    
-    # Remove any category dummies that might exist
-    cat_columns = [col for col in features.columns if col.startswith("cat_")]
-    features = _safe_drop_columns(features, cat_columns)
-    
-    # --- Final Data Cleaning ---
-    # Ensure all features are numeric
-    for col in features.columns:
-        # if features[col].dtype == np.bool: 
-        #     features[col] = features[col].astype(int)
 
-        if features[col].dtype == object:
-            features[col] = pd.to_numeric(features[col], errors="coerce")
-    
-    # Handle infinite values and NaNs
+    rows: List[Dict[str, float]] = []
+
+    for _, row in df.iterrows():
+        f: Dict[str, float] = {}
+
+        # base & requirements (full vector)
+        f.update(extract_base_attributes(row))
+        f.update(extract_requirements(row))
+
+        # properties (avg damages, aps, etc.)
+        f.update(extract_weapon_properties(row))
+
+        # mods (implicit+explicit attributes, plus explicit tier/level peaks)
+        f.update(extract_mod_attributes(row))
+
+        # per-channel dps only; then drop aps & raw channels to avoid perfect collinearity
+        if compute_dps:
+            dps = derive_channel_dps(f)
+            f.update(dps)
+            for k in ("attack_speed", "phys_damage", "fire_damage", "cold_damage", "lightning_damage", "chaos_damage"):
+                f.pop(k, None)
+
+        rows.append(f)
+
+    features = pd.DataFrame(rows, index=df.index)
+
+    # ---- Optionality (continuous replacement for boolean constraints) ----
+    # helper booleans from raw df (NOT added to the feature set)
+    corrupted_s = df["corrupted"].astype(bool) if "corrupted" in df.columns else pd.Series(False, index=df.index)
+    unmod_s = df["unmodifiable"].astype(bool) if "unmodifiable" in df.columns else pd.Series(False, index=df.index)
+    craftable = (~corrupted_s) & (~unmod_s)  # helper only
+
+    # per-category cap95 of explicit_mod_count
+    meta_cat = df["category"].astype(str) if "category" in df.columns else pd.Series("unknown", index=df.index)
+    if "explicit_mod_count" not in features.columns:
+        features["explicit_mod_count"] = 0.0  # safety
+
+    cap95_by_cat = (
+        features.groupby(meta_cat)["explicit_mod_count"]
+        .quantile(0.95)
+        .reindex(meta_cat.unique())
+    )
+    cap_map = meta_cat.map(cap95_by_cat.to_dict()).fillna(0.0)
+
+    open_slots_est = craftable.astype(float) * np.maximum(0.0, cap_map.values - features["explicit_mod_count"].values)
+    features["open_slots_est"] = open_slots_est
+
+    # targets
+    targets = pd.DataFrame(index=df.index)
+    targets["price"] = pd.to_numeric(df.get("price_amount_in_base", 0), errors="coerce").fillna(0.0)
+    targets["log_price"] = np.log1p(targets["price"].clip(lower=0.0))
+
+    # metadata
+    metadata = pd.DataFrame(index=df.index)
+    for col in ["id", "league", "indexed", "rarity", "category", "base_type", "type_line", "name"]:
+        if col in df.columns:
+            metadata[col] = df[col].astype(str)
+
+    # numeric cleanup
     features.replace([np.inf, -np.inf], np.nan, inplace=True)
     features.fillna(0.0, inplace=True)
-    targets.replace([np.inf, -np.inf], np.nan, inplace=True)
-    targets.fillna(0.0, inplace=True)
-    
+
+    # ensure no total DPS columns sneak in from upstream
+    totals_to_drop = ["dps", "edps", "calc_edps", "calc_total_dps", "total_dps"]
+    features.drop(columns=[c for c in totals_to_drop if c in features.columns], inplace=True, errors="ignore")
+
+    # remove zero-variance columns
+    var = features.var()
+    zero_var = var[var <= 1e-12].index
+    if len(zero_var) > 0:
+        features.drop(columns=list(zero_var), inplace=True, errors="ignore")
+
     return features, targets, metadata
 
-def load_and_process_weapon_data(
+# -----------------------------------------------------------------------------
+# Category split helper (bottom-up per category; uniques as their own category)
+# -----------------------------------------------------------------------------
+def create_category_models(
+    features: pd.DataFrame,
+    targets: pd.DataFrame,
+    metadata: pd.DataFrame
+) -> Dict[str, Tuple[pd.DataFrame, pd.DataFrame]]:
+    models: Dict[str, Tuple[pd.DataFrame, pd.DataFrame]] = {}
+    if "category" not in metadata.columns:
+        return models
+
+    cats = metadata["category"].astype(str)
+    is_unique = (metadata.get("rarity", "").astype(str).str.lower() == "unique")
+
+    for cat in sorted(cats.dropna().unique()):
+        mask = (cats == cat)
+        if (mask & ~is_unique).any():
+            models[cat] = (features[mask & ~is_unique].copy(), targets[mask & ~is_unique].copy())
+        if (mask & is_unique).any():
+            names = metadata.loc[mask & is_unique, "type_line"].astype(str).dropna().unique()
+            for nm in names:
+                sel = mask & is_unique & (metadata["type_line"].astype(str) == nm)
+                if sel.sum() >= 5:
+                    models[f"unique_{nm}"] = (features[sel].copy(), targets[sel].copy())
+    return models
+
+# -----------------------------------------------------------------------------
+# IO
+# -----------------------------------------------------------------------------
+def load_and_process_item_data(
     file_path: str | Path,
     *,
     base_path: Optional[str | Path] = None,
     **feature_kwargs
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """
-    Load parquet file and process into weapon features.
-    
-    Args:
-        file_path: Path to parquet file
-        base_path: Base directory for relative paths
-        **feature_kwargs: Arguments passed to make_weapon_features
-    
-    Returns:
-        Tuple of (features, targets, metadata) DataFrames
-    """
-    # Resolve file path
     path = Path(file_path).expanduser()
     if not path.is_absolute():
         root = Path(base_path).expanduser().resolve() if base_path else find_project_root()
         path = (root / path).resolve()
-    
     if not path.exists():
         raise FileNotFoundError(f"File not found: {path}")
-    
-    # Load parquet with engine fallback
+
     try:
         df = pd.read_parquet(path, engine="pyarrow")
-    except Exception as pyarrow_error:
+    except Exception:
         try:
             df = pd.read_parquet(path, engine="fastparquet")
-        except Exception as fastparquet_error:
-            raise RuntimeError(
-                "Failed to read parquet file with available engines. "
-                "Please install pyarrow or fastparquet.\n"
-                f"PyArrow error: {pyarrow_error}\n"
-                f"FastParquet error: {fastparquet_error}"
-            ) from None
-    
-    return make_weapon_features(df, **feature_kwargs)
+        except Exception as e:
+            raise RuntimeError(f"Failed to read parquet: {e}")
 
-def validate_features(features: pd.DataFrame, targets: pd.DataFrame) -> Dict[str, Any]:
-    """Validate processed features and targets for common issues."""
-    validation_results = {}
-    
-    # Check shapes
-    validation_results["features_shape"] = features.shape
-    validation_results["targets_shape"] = targets.shape
-    
-    # Check for NaN and infinite values
-    features_array = features.to_numpy()
-    targets_array = targets.to_numpy()
-    
-    validation_results["features_nan_count"] = int(pd.isna(features_array).sum())
-    validation_results["targets_nan_count"] = int(pd.isna(targets_array).sum())
-    validation_results["features_inf_count"] = int(np.isinf(features_array).sum())
-    validation_results["targets_inf_count"] = int(np.isinf(targets_array).sum())
-    
-    # Identify problematic columns
-    features_nan_cols = features.columns[features.isna().any()].tolist()
-    targets_nan_cols = targets.columns[targets.isna().any()].tolist()
-    
-    validation_results["features_nan_columns"] = features_nan_cols
-    validation_results["targets_nan_columns"] = targets_nan_cols
-    
-    # Print summary
-    print(f"Features shape: {features.shape}, Targets shape: {targets.shape}")
-    print(f"NaN values - Features: {validation_results['features_nan_count']}, Targets: {validation_results['targets_nan_count']}")
-    print(f"Infinite values - Features: {validation_results['features_inf_count']}, Targets: {validation_results['targets_inf_count']}")
-    
-    if features_nan_cols:
-        cols_preview = features_nan_cols[:10]
-        suffix = "..." if len(features_nan_cols) > 10 else ""
-        print(f"Features with NaN ({len(features_nan_cols)}): {cols_preview}{suffix}")
-    
-    if targets_nan_cols:
-        print(f"Targets with NaN: {targets_nan_cols}")
-    
-    return validation_results
+    return make_item_features(df, **feature_kwargs)
+
+# -----------------------------------------------------------------------------
+# Validation
+# -----------------------------------------------------------------------------
+def validate_features(features: pd.DataFrame, targets: pd.DataFrame) -> None:
+    print(f"Dataset: {len(features)} samples, {features.shape[1]} features")
+    print(f"Price range: {targets['price'].min():.2f} - {targets['price'].max():.2f}")
+    print(f"Mean price: {targets['price'].mean():.2f}, Median: {targets['price'].median():.2f}")
+
+    key_feats = [
+        "pdps", "fdps", "cdps", "ldps", "chaos_dps",
+        "open_slots_est",
+        "highest_explicit_tier_num", "highest_explicit_level",
+        "req_level", "req_str", "req_dex", "req_int",
+        "implicit_mod_count", "explicit_mod_count",
+        "other_mods_avg_value", "other_mods_avg_level",
+    ]
+    print("\nkey features present:")
+    for k in key_feats:
+        if k in features.columns:
+            nz = int((features[k] != 0).sum())
+            mean_val = float(features.loc[features[k] != 0, k].mean()) if nz else 0.0
+            print(f"  {k}: {nz} nonzero, avg={mean_val:.3f}")
+
+    # sanity: totals should be gone
+    forbidden = {"dps", "edps", "calc_edps", "calc_total_dps", "total_dps"}
+    present_forbidden = sorted([c for c in forbidden if c in features.columns])
+    if present_forbidden:
+        print(f"\nWARNING: drop totals to avoid multicollinearity: {present_forbidden}")
+
+# Example
+if __name__ == "__main__":
+    X, y, meta = load_and_process_item_data(
+        "training_data/overall/weapon_bow_overall_standard.parquet",
+        compute_dps=True,
+    )
+    validate_features(X, y)
+    buckets = create_category_models(X, y, meta)
+    print(f"\ncreated {len(buckets)} category models:")
+    for name, (fx, ty) in buckets.items():
+        print(f"  {name}: {len(fx)} rows")
+
+
+def split_by_rarity(
+    features: pd.DataFrame,
+    targets: pd.DataFrame,
+    metadata: pd.DataFrame,
+    *,
+    copy: bool = True,
+) -> Tuple[Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
+           Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]]:
+    """
+    Split into craftables (Normal/Magic/Rare) vs Unique.
+    Returns: (craft_X, craft_y, craft_meta), (uniq_X, uniq_y, uniq_meta)
+    """
+    if "rarity" in metadata.columns:
+        rarity = metadata["rarity"].astype(str).str.lower()
+        is_unique = rarity.eq("unique")
+    else:
+        # if no rarity column, treat everything as craftable
+        is_unique = pd.Series(False, index=metadata.index)
+
+    is_craft = ~is_unique
+
+    def pick(mask: pd.Series):
+        if copy:
+            return (features.loc[mask].copy(),
+                    targets.loc[mask].copy(),
+                    metadata.loc[mask].copy())
+        return (features.loc[mask], targets.loc[mask], metadata.loc[mask])
+
+    return pick(is_craft), pick(is_unique)
+
+
+def load_and_process_item_data_split(
+    file_path: str | Path,
+    *,
+    base_path: Optional[str | Path] = None,
+    **feature_kwargs
+) -> Tuple[Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
+           Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]]:
+    """
+    Convenience wrapper: run feature engineering, then split by rarity.
+    Returns: (craft_X, craft_y, craft_meta), (uniq_X, uniq_y, uniq_meta)
+    """
+    X, y, meta = load_and_process_item_data(
+        file_path, base_path=base_path, **feature_kwargs
+    )
+    return split_by_rarity(X, y, meta)
