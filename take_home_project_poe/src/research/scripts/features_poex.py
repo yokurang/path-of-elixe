@@ -160,13 +160,13 @@ def parse_sockets(row: pd.Series) -> Dict[str, float]:
     sockets = _safe_parse_json(row.get("sockets", []))
     if isinstance(sockets, list):
         out["socket_count"] = float(len(sockets))
-        try:
-            out["rune_group_count"] = float(len({d.get("group") for d in sockets if isinstance(d, dict) and "group" in d}))
-        except Exception:
-            out["rune_group_count"] = 0.0
+        # try:
+        #     out["rune_group_count"] = float(len({d.get("group") for d in sockets if isinstance(d, dict) and "group" in d}))
+        # except Exception:
+        #     out["rune_group_count"] = 0.0
     else:
         out["socket_count"] = 0.0
-        out["rune_group_count"] = 0.0
+        # out["rune_group_count"] = 0.0
     return out
 
 def parse_requirements(row: pd.Series) -> Dict[str, float]:
@@ -401,50 +401,43 @@ def derive_channel_dps(feats: Dict[str, float]) -> Dict[str, float]:
     return out
 
 # -----------------------------------------------------------------------------
-# Optional augmentation
+# Optional augmentation (now: cleanup only; no feature creation)
 # -----------------------------------------------------------------------------
-def _log1p_pos(s: pd.Series) -> pd.Series:
-    return np.log1p(np.clip(s.astype(float), a_min=0.0, a_max=None))
-
-def _hinge(x: pd.Series, knot: float) -> pd.Series:
-    return np.maximum(0.0, x - knot)
-
 def augment_features(X: pd.DataFrame) -> pd.DataFrame:
     X = X.copy()
 
-    for c in ["pdps", "chaos_dps",
-              "open_slots_est", "req_level", "req_dex", "req_str", "req_int",
-              "highest_explicit_tier_num", "highest_explicit_level",
-              "implicit_mod_count", "explicit_mod_count",
-              "other_mods_avg_value", "other_mods_count",
-              "crit_chance", "quality", "ilvl"]:
-        if c in X.columns:
-            X[f"log1p_{c}"] = _log1p_pos(X[c])
+    # proactively drop disallowed/legacy engineered columns if present
+    DROP_COLS = [
+        "log1p_pdps",
+        "log1p_chaos_dps",
+        "reqdex_x_pdps",
+        "log1p_open_slots_est",
+        "log1p_req_level",
+        "log1p_req_dex",
+        "log1p_highest_explicit_tier_num",
+        "log1p_highest_explicit_level",
+        "log1p_implicit_mod_count",
+        "log1p_explicit_mod_count",
+        "log1p_other_mods_avg_value",
+        "log1p_other_mods_count",
+        "log1p_crit_chance",
+        "log1p_quality",
+        "log1p_ilvl",
+        "pdps_hinge_1",
+        "pdps_hinge_2",
+        "pdps_hinge_3",
+        "pdps_x_crit",
+        "chaos_x_crit",
+        "pdps_x_open",
+        "chaos_x_open",
+    ]
+    X.drop(columns=[c for c in DROP_COLS if c in X.columns], inplace=True, errors="ignore")
 
-    def _add_hinges(col: str, prefix: str):
-        if col not in X.columns: return
-        base = X[col]
-        nz = base[base > 0]
-        knots = (nz.quantile([0.2, 0.5, 0.8]).values if len(nz) >= 30 else np.array([base.median()]))
-        for i, k in enumerate(knots, 1):
-            X[f"{prefix}_hinge_{i}"] = _hinge(base, float(k))
-
-    _add_hinges("log1p_pdps", "pdps")
-
-    crit = X.get("crit_chance", 0.0)
-    open_slots = X.get("open_slots_est", 0.0)
-
-    X["pdps_x_crit"]   = X.get("pdps", 0.0) * crit
-    X["chaos_x_crit"]  = X.get("chaos_dps", 0.0) * crit
-    X["pdps_x_open"]   = X.get("pdps", 0.0) * open_slots
-    X["chaos_x_open"]  = X.get("chaos_dps", 0.0) * open_slots
-
-    if "req_dex" in X.columns:
-        X["reqdex_x_pdps"] = X["req_dex"] * X.get("pdps", 0.0)
-
+    # clean infinities/nans
     X.replace([np.inf, -np.inf], np.nan, inplace=True)
     X.fillna(0.0, inplace=True)
 
+    # prune zero-variance columns
     var = X.var()
     zero_var = var[var <= 1e-12].index
     if len(zero_var) > 0:

@@ -25,7 +25,7 @@ OUTPUT_LOG = Path("output_generate_training_data.log")
 LEAGUE = "Standard"
 # LEAGUE = "Rise%20of%20the%20Abyssal"
 BASE_CURRENCY = "Exalted Orb"     # assignment requires Exalted Orb as base
-PER_COMBO_DEFAULT = 100            # ≤50 rows saved per combo (recorder returns up to 100 per search)
+PER_COMBO_DEFAULT = 25000            # ≤50 rows saved per combo (recorder returns up to 100 per search)
 
 # Root logger + file handler
 _root = logging.getLogger()
@@ -209,6 +209,7 @@ def generate_training_data(
                 sort_key="price",
                 sort_dir="asc",
             )
+            payload["offset"] = 0
             try:
                 df_all = search_to_dataframe(
                     payload=payload,
@@ -265,7 +266,7 @@ def generate_training_data(
                 sort_dir="asc",
             )
             _add_corrupted(payload, is_corr)
-
+            payload["offset"] = 0
             try:
                 df_all = search_to_dataframe(
                     payload=payload,

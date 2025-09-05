@@ -876,6 +876,7 @@ def build_basic_payload(
             "filters": filters,
         },
         "sort": {sort_key: sort_dir},
+        "offset": 0,
     }
     return payload
 

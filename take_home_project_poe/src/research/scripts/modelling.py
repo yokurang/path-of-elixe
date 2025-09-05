@@ -33,7 +33,7 @@ def _ensure_vector(y: pd.Series | pd.DataFrame | np.ndarray) -> np.ndarray:
         return y.to_numpy()
     arr = np.asarray(y)
     if arr.ndim == 2 and arr.shape[1] == 1:
-        arr = arr.ravel()
+            arr = arr.ravel()
     return arr
 
 
@@ -71,13 +71,10 @@ def _check_X_is_prepared(X: pd.DataFrame, where: str = "") -> None:
 # Helpers for models inside Pipelines
 # ======================================================================
 def _get_linear_step(model_or_pipe):
-    """
-    Return the linear estimator (HuberRegressor/SGDRegressor) from a Pipeline or the estimator itself.
-    """
+    """Return the linear estimator (HuberRegressor/SGDRegressor) from a Pipeline or the estimator itself."""
     if hasattr(model_or_pipe, "coef_"):
         return model_or_pipe
     if hasattr(model_or_pipe, "named_steps"):
-        # search in reverse order to find the final estimator first
         for name in reversed(list(model_or_pipe.named_steps.keys())):
             est = model_or_pipe.named_steps[name]
             if hasattr(est, "coef_"):
@@ -118,9 +115,7 @@ def cross_val_r2_huber(
     tol: float = 1e-5,
     verbose: bool = True,
 ) -> List[float]:
-    """
-    K-fold R^2 using Huber loss (robust linear) with a Pipeline (scaler + Huber).
-    """
+    """K-fold R^2 using Huber loss (robust linear) with a Pipeline (scaler + Huber)."""
     _check_X_is_prepared(X, where="[CV]")
     y_vec = _ensure_vector(y)
     kf = KFold(n_splits=n_splits, shuffle=shuffle, random_state=random_state)
@@ -164,10 +159,9 @@ def train_mlr_with_holdout(  # kept name for compatibility
     tol: float = 1e-5,
     verbose: bool = True,
     plots: bool = True,
+    model_name: str = "Huber MLR",
 ) -> Dict[str, Any]:
-    """
-    Train/test split and fit robust linear (Huber loss) using Pipeline(scaler+Huber).
-    """
+    """Train/test split and fit robust linear (Huber loss) using Pipeline(scaler+Huber)."""
     _check_X_is_prepared(X, where="[train/test]")
     y_vec = _ensure_vector(y)
     X_train, X_test, y_train, y_test = train_test_split(
@@ -195,14 +189,14 @@ def train_mlr_with_holdout(  # kept name for compatibility
         "mae_test": float(mean_absolute_error(y_test, y_pred_te)),
     }
     if verbose:
-        print("\nHoldout metrics:")
+        print(f"\n[{model_name}] Holdout metrics:")
         for k, v in metrics.items():
             print(f"  {k}: {v:.4f}")
 
     coef_df = _coef_frame(model, X_train.columns)
 
     if plots:
-        plot_basic_residuals(y_train, y_pred_tr, y_test, y_pred_te)
+        plot_basic_residuals(y_train, y_pred_tr, y_test, y_pred_te, model_name=model_name)
 
     return {
         "model": model,
@@ -215,51 +209,54 @@ def train_mlr_with_holdout(  # kept name for compatibility
 
 
 # ======================================================================
-# Residual diagnostics (2×2 and richer 3×3 set)
+# Residual diagnostics (focused on requested metrics)
 # ======================================================================
 def plot_basic_residuals(
     y_train: np.ndarray,
     y_pred_train: np.ndarray,
     y_test: np.ndarray,
     y_pred_test: np.ndarray,
+    *,
+    model_name: str = "Model",
 ) -> None:
     """2×2 residual diagnostic plots (matplotlib only)."""
     residuals_train = y_train - y_pred_train
     residuals_test = y_test - y_pred_test
 
     fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    fig.suptitle(f"{model_name}: Basic Residual Diagnostics", fontsize=15)
 
-    # Residuals vs Fitted (Train)
+    # 1. Residuals vs Fitted (Train)
     axes[0, 0].scatter(y_pred_train, residuals_train, alpha=0.6)
     axes[0, 0].axhline(0, color="r", linestyle="--")
     axes[0, 0].set_xlabel("Fitted Values")
     axes[0, 0].set_ylabel("Residuals")
-    axes[0, 0].set_title("Residuals vs Fitted (Training)")
+    axes[0, 0].set_title("1. Residuals vs Fitted (Training)")
     axes[0, 0].grid(True, alpha=0.3)
 
-    # Q-Q plot (Train residuals)
+    # 2. Q-Q plot (Train residuals)
     stats.probplot(residuals_train, dist="norm", plot=axes[0, 1])
-    axes[0, 1].set_title("Q-Q Plot (Training)")
+    axes[0, 1].set_title("2. Q-Q Plot (Training)")
 
-    # Residuals vs Fitted (Test)
+    # 3. Residuals vs Fitted (Test)
     axes[1, 0].scatter(y_pred_test, residuals_test, alpha=0.6, color="orange")
     axes[1, 0].axhline(0, color="r", linestyle="--")
     axes[1, 0].set_xlabel("Fitted Values")
     axes[1, 0].set_ylabel("Residuals")
-    axes[1, 0].set_title("Residuals vs Fitted (Test)")
+    axes[1, 0].set_title("3. Residuals vs Fitted (Test)")
     axes[1, 0].grid(True, alpha=0.3)
 
-    # Actual vs Predicted (Test)
+    # 4. Actual vs Predicted (Test)
     axes[1, 1].scatter(y_test, y_pred_test, alpha=0.6, color="orange")
     lo = min(np.min(y_test), np.min(y_pred_test))
     hi = max(np.max(y_test), np.max(y_pred_test))
     axes[1, 1].plot([lo, hi], [lo, hi], "r--", lw=2)
     axes[1, 1].set_xlabel("Actual")
     axes[1, 1].set_ylabel("Predicted")
-    axes[1, 1].set_title("Actual vs Predicted (Test)")
+    axes[1, 1].set_title("4. Actual vs Predicted (Test)")
     axes[1, 1].grid(True, alpha=0.3)
 
-    plt.tight_layout()
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
     plt.show()
 
 
@@ -270,6 +267,8 @@ def analyze_linear_performance(
     X_train: Optional[pd.DataFrame] = None,
     y_train: Optional[pd.Series | np.ndarray | pd.DataFrame] = None,
     metadata: Optional[pd.DataFrame] = None,
+    *,
+    model_name: Optional[str] = None,
 ) -> pd.DataFrame:
     """
     Build an analysis dataframe with residuals, prices (log & expm1), and
@@ -286,7 +285,10 @@ def analyze_linear_performance(
     abs_residuals = np.abs(residuals)
 
     print("=" * 70)
-    print("LINEAR REGRESSION PERFORMANCE DIAGNOSTICS")
+    header = "PERFORMANCE DIAGNOSTICS"
+    if model_name:
+        header = f"{model_name} {header}"
+    print(header)
     print("=" * 70)
     print(f"Overall Test R²: {r2_score(y_test, y_pred):.4f}")
     print(f"Mean Absolute Error: {abs_residuals.mean():.4f}")
@@ -305,8 +307,12 @@ def analyze_linear_performance(
     )
 
     # Add common features for slicing/plots if present
-    for col in ["ilvl", "pdps", "fdps", "cdps", "ldps", "chaos_dps", "crit_chance", "quality",
-                "req_level", "req_str", "req_dex", "req_int", "open_slots_est", "socket_count"]:
+    for col in [
+        "explicit_mod_count", "implicit_mod_count",
+        "pdps", "fdps", "cdps", "ldps", "chaos_dps",
+        "req_level", "req_str", "req_dex", "req_int",
+        "ilvl", "quality", "socket_count", "open_slots_est"
+    ]:
         if col in X_test.columns:
             df[col] = X_test[col]
 
@@ -329,141 +335,237 @@ def analyze_linear_performance(
         if socket_cols:
             df["total_sockets"] = X_test[socket_cols].sum(axis=1)
 
+    # corrupted flag (from X or metadata)
+    corrupt_col = None
+    for c in X_test.columns:
+        if str(c).lower() in {"corrupted", "is_corrupted"}:
+            corrupt_col = c
+            break
+    if corrupt_col is not None:
+        df["corrupted"] = X_test[corrupt_col].astype(bool)
+    elif metadata is not None:
+        for c in metadata.columns:
+            if str(c).lower() in {"corrupted", "is_corrupted"}:
+                df["corrupted"] = metadata.loc[df.index, c].astype(bool)
+                break
+
     return df
 
 
-def plot_residual_patterns(analysis_df: pd.DataFrame) -> None:
-    """Richer 3×3 panel of residual patterns (fails safe with messages)."""
-    fig, axes = plt.subplots(3, 3, figsize=(18, 15))
-    axes = axes.flatten()
+def plot_residual_patterns(
+    analysis_df: pd.DataFrame,
+    *,
+    model_name: str = "Model",
+) -> None:
+    """
+    Focused residual panels (dynamic grid). Always shows:
+      - Residuals vs Predicted
+      - Actual vs Predicted
+    And, if present in analysis_df, also shows:
+      explicit_mod_count, implicit_mod_count,
+      pdps, fdps, cdps, ldps, chaos_dps,
+      req_level, req_str, req_dex, req_int,
+      ilvl,
+      Residual distribution (hist),
+      Residuals by Socket Count (boxplot),
+      Residuals by Corruption (bar),
+      Residuals by Rarity (bar)
+    """
+    panels: List[Tuple[str, Optional[str]]] = []
 
-    # 1. Residuals vs Predicted
-    if len(analysis_df) > 0:
-        axes[0].scatter(analysis_df["predicted"], analysis_df["residual"], alpha=0.6)
-    else:
-        axes[0].text(0.5, 0.5, "No data", ha="center", va="center", transform=axes[0].transAxes)
-    axes[0].axhline(0, color="red", linestyle="--", alpha=0.7)
-    axes[0].set_xlabel("Predicted Log Price")
-    axes[0].set_ylabel("Residuals")
-    axes[0].set_title("Residuals vs Predicted")
-    axes[0].grid(True, alpha=0.3)
+    # Always include these first/last
+    panels.append(("Residuals vs Predicted", None))
 
-    # 2. Residuals vs Actual
-    if len(analysis_df) > 0:
-        axes[1].scatter(analysis_df["actual"], analysis_df["residual"], alpha=0.6)
-    else:
-        axes[1].text(0.5, 0.5, "No data", ha="center", va="center", transform=axes[1].transAxes)
-    axes[1].axhline(0, color="red", linestyle="--", alpha=0.7)
-    axes[1].set_xlabel("Actual Log Price")
-    axes[1].set_ylabel("Residuals")
-    axes[1].set_title("Residuals vs Actual")
-    axes[1].grid(True, alpha=0.3)
+    # Scatter panels for requested numeric features
+    feature_order = [
+        "explicit_mod_count", "implicit_mod_count",
+        "pdps", "fdps", "cdps", "ldps", "chaos_dps",
+        "req_level", "req_str", "req_dex", "req_int",
+        "ilvl",
+    ]
+    for f in feature_order:
+        if f in analysis_df.columns:
+            panels.append((f, f))
 
-    # 3. Abs residuals by price quantile
-    try:
-        price_bins = pd.qcut(
-            analysis_df["actual"], q=5,
-            labels=["Very Low", "Low", "Medium", "High", "Very High"], duplicates="drop"
-        )
-        agg = analysis_df.groupby(price_bins)["abs_residual"].agg(["mean", "std", "count"])
-        axes[2].bar(range(len(agg)), agg["mean"], yerr=agg["std"], capsize=5, alpha=0.7)
-        axes[2].set_xticks(range(len(agg)))
-        axes[2].set_xticklabels(agg.index, rotation=45)
-        axes[2].set_ylabel("Mean Absolute Residual")
-        axes[2].set_title("Prediction Error by Price Range")
-        axes[2].grid(True, alpha=0.3)
-    except Exception:
-        axes[2].text(0.5, 0.5, "Not enough unique\nvalues for binning",
-                     ha="center", va="center", transform=axes[2].transAxes)
+    # Distribution of residuals
+    panels.append(("Residual Distribution", None))
 
-    # 4. Residuals by rarity (if present)
-    if "rarity" in analysis_df.columns and analysis_df["rarity"].nunique() > 0:
-        grp = analysis_df.groupby("rarity")["residual"].agg(["mean", "std", "count"])
-        if len(grp) > 0:
-            axes[3].bar(range(len(grp)), grp["mean"], yerr=grp["std"], capsize=5, alpha=0.7)
-            axes[3].set_xticks(range(len(grp)))
-            axes[3].set_xticklabels(grp.index, rotation=45)
+    # Socket count boxplot if available
+    if "total_sockets" in analysis_df.columns or "socket_count" in analysis_df.columns:
+        panels.append(("Residuals by Socket Count", None))
+
+    # Corruption panel if available
+    if "corrupted" in analysis_df.columns:
+        panels.append(("Residuals by Corruption", None))
+
+    # Rarity panel if available
+    if "rarity" in analysis_df.columns and analysis_df["rarity"].notna().any():
+        panels.append(("Residuals by Rarity", "rarity"))
+
+    # Always end with actual vs predicted
+    panels.append(("Actual vs Predicted", None))
+
+    # Layout
+    n = len(panels)
+    ncols = 3
+    nrows = int(np.ceil(n / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 4.8 * nrows))
+    fig.suptitle(f"{model_name}: Residual Pattern Panels", fontsize=15)
+    axes = np.atleast_1d(axes).ravel()
+
+    # Helper to safely scatter with a provided title
+    def _scatter(ax, x, y, xlabel, panel_title, ylabel="Residuals"):
+        if len(x) >= 3:
+            ax.scatter(x, y, alpha=0.6)
+            ax.axhline(0, color="red", linestyle="--", alpha=0.7)
+            ax.set_xlabel(xlabel)
+            ax.set_ylabel(ylabel)
+            ax.set_title(panel_title)
+            ax.grid(True, alpha=0.3)
         else:
-            axes[3].text(0.5, 0.5, "No rarity data", ha="center", va="center", transform=axes[3].transAxes)
-    else:
-        axes[3].text(0.5, 0.5, "No rarity column", ha="center", va="center", transform=axes[3].transAxes)
-    axes[3].set_ylabel("Mean Residual")
-    axes[3].set_title("Prediction Bias by Rarity")
-    axes[3].axhline(0, color="red", linestyle="--", alpha=0.7)
-    axes[3].grid(True, alpha=0.3)
+            ax.text(0.5, 0.5, "Not enough data", ha="center", va="center", transform=ax.transAxes)
+            ax.set_title(panel_title)
 
-    # 5. Residuals vs PDPS (if present)
-    if "pdps" in analysis_df.columns:
-        mask = analysis_df["pdps"] > 0
-        if mask.sum() >= 3:
-            axes[4].scatter(analysis_df.loc[mask, "pdps"], analysis_df.loc[mask, "residual"], alpha=0.6)
-            axes[4].set_xlabel("Physical DPS")
-            axes[4].set_ylabel("Residuals")
-            axes[4].set_title("Residuals vs Physical DPS")
-            axes[4].grid(True, alpha=0.3)
+    # Plot panels
+    for i, (label, feature) in enumerate(panels):
+        ax = axes[i]
+        prefix = f"{i+1}. "
+
+        if label == "Residuals vs Predicted":
+            _scatter(
+                ax,
+                analysis_df["predicted"], analysis_df["residual"],
+                "Predicted Log Price",
+                panel_title=prefix + "Residuals vs Predicted"
+            )
+
+        elif label == "Actual vs Predicted":
+            title = prefix + "Actual vs Predicted"
+            if len(analysis_df) > 0:
+                ax.scatter(analysis_df["actual"], analysis_df["predicted"], alpha=0.6)
+                lo = analysis_df[["actual", "predicted"]].min().min()
+                hi = analysis_df[["actual", "predicted"]].max().max()
+                ax.plot([lo, hi], [lo, hi], "r--", alpha=0.7)
+                ax.set_xlabel("Actual Log Price")
+                ax.set_ylabel("Predicted Log Price")
+                ax.set_title(title)
+                ax.grid(True, alpha=0.3)
+            else:
+                ax.text(0.5, 0.5, "No data", ha="center", va="center", transform=ax.transAxes)
+                ax.set_title(title)
+
+        elif label == "Residual Distribution":
+            title = prefix + "Residual Distribution"
+            if len(analysis_df) > 0:
+                ax.hist(analysis_df["residual"], bins=30, alpha=0.7, density=True)
+                ax.axvline(0, color="red", linestyle="--", alpha=0.7)
+                ax.set_xlabel("Residuals")
+                ax.set_ylabel("Density")
+                ax.set_title(title)
+                ax.grid(True, alpha=0.3)
+            else:
+                ax.text(0.5, 0.5, "No data", ha="center", va="center", transform=ax.transAxes)
+                ax.set_title(title)
+
+        elif label == "Residuals by Socket Count":
+            title = prefix + "Residuals by Socket Count"
+            ts_col = "total_sockets" if "total_sockets" in analysis_df.columns else "socket_count"
+            vals, labels = [], []
+            if ts_col in analysis_df.columns:
+                for s in sorted(analysis_df[ts_col].dropna().unique()):
+                    mask = analysis_df[ts_col] == s
+                    if mask.sum() >= 5:
+                        vals.append(analysis_df.loc[mask, "residual"].values)
+                        labels.append(f"{int(s)} sockets")
+            if vals:
+                ax.boxplot(vals, labels=labels)
+                ax.set_ylabel("Residuals")
+                ax.set_title(title)
+                ax.grid(True, alpha=0.3)
+                ax.tick_params(axis="x", rotation=45)
+            else:
+                ax.text(0.5, 0.5, "Not enough per-socket groups", ha="center", va="center",
+                        transform=ax.transAxes)
+                ax.set_title(title)
+
+        elif label == "Residuals by Corruption":
+            title = prefix + "Prediction Bias by Corruption"
+            try:
+                grp = (analysis_df
+                       .dropna(subset=["corrupted"])
+                       .assign(corrupted=lambda d: d["corrupted"].astype(bool))
+                       .groupby("corrupted")["residual"]
+                       .agg(["mean", "std", "count"])
+                       .reindex([False, True]))
+                if grp["count"].fillna(0).sum() > 0:
+                    yvals = grp["mean"].fillna(0).values
+                    yerr = grp["std"].fillna(0).values
+                    idxs = np.arange(len(grp))
+                    ax.bar(idxs, yvals, yerr=yerr, capsize=5, alpha=0.7)
+                    ax.set_xticks(idxs)
+                    ax.set_xticklabels(["Not corrupted", "Corrupted"], rotation=0)
+                    ax.axhline(0, color="red", linestyle="--", alpha=0.7)
+                    ax.set_ylabel("Mean Residual")
+                    ax.set_title(title)
+                    ax.grid(True, alpha=0.3)
+                else:
+                    ax.text(0.5, 0.5, "No corruption data", ha="center", va="center",
+                            transform=ax.transAxes)
+                    ax.set_title(title)
+            except Exception:
+                ax.text(0.5, 0.5, "Corruption panel error", ha="center", va="center",
+                        transform=ax.transAxes)
+                ax.set_title(title)
+
+        elif label == "Residuals by Rarity":
+            title = prefix + "Prediction Bias by Rarity"
+            try:
+                grp = (analysis_df
+                       .dropna(subset=["rarity"])
+                       .groupby("rarity")["residual"]
+                       .agg(["mean", "std", "count"])
+                       .sort_values("mean"))
+                if len(grp) > 0:
+                    yvals = grp["mean"].values
+                    yerr = grp["std"].fillna(0.0).values
+                    idxs = np.arange(len(grp))
+                    ax.bar(idxs, yvals, yerr=yerr, capsize=5, alpha=0.7)
+                    ax.set_xticks(idxs)
+                    ax.set_xticklabels(grp.index, rotation=45, ha="right")
+                    ax.axhline(0, color="red", linestyle="--", alpha=0.7)
+                    ax.set_ylabel("Mean Residual")
+                    ax.set_title(title)
+                    ax.grid(True, alpha=0.3)
+                else:
+                    ax.text(0.5, 0.5, "No rarity data", ha="center", va="center",
+                            transform=ax.transAxes)
+                    ax.set_title(title)
+            except Exception:
+                ax.text(0.5, 0.5, "Rarity panel error", ha="center", va="center",
+                        transform=ax.transAxes)
+                ax.set_title(title)
+
         else:
-            axes[4].text(0.5, 0.5, "Not enough PDPS>0 rows", ha="center", va="center",
-                         transform=axes[4].transAxes)
-    else:
-        axes[4].text(0.5, 0.5, "No PDPS feature", ha="center", va="center", transform=axes[4].transAxes)
+            # Generic scatter: residuals vs selected feature
+            x = analysis_df[feature]
+            y = analysis_df["residual"]
+            # For DPS fields, prefer rows with positive values if available
+            if feature in {"pdps", "fdps", "cdps", "ldps", "chaos_dps"}:
+                mask = x > 0
+                if mask.sum() >= 3:
+                    x = x[mask]
+                    y = y[mask]
+            _scatter(
+                ax, x, y,
+                xlabel=feature,
+                panel_title=prefix + f"Residuals vs {feature}"
+            )
 
-    # 6. Residuals vs Item Level
-    if "ilvl" in analysis_df.columns and analysis_df["ilvl"].nunique() >= 2:
-        axes[5].scatter(analysis_df["ilvl"], analysis_df["residual"], alpha=0.6)
-    else:
-        axes[5].text(0.5, 0.5, "No/low variety ilvl", ha="center", va="center", transform=axes[5].transAxes)
-    axes[5].axhline(0, color="red", linestyle="--", alpha=0.7)
-    axes[5].set_xlabel("Item Level")
-    axes[5].set_ylabel("Residuals")
-    axes[5].set_title("Residuals vs Item Level")
-    axes[5].grid(True, alpha=0.3)
+    # Clear any unused axes
+    for j in range(i + 1, len(axes)):
+        axes[j].axis("off")
 
-    # 7. Residual distribution
-    if len(analysis_df) > 0:
-        axes[6].hist(analysis_df["residual"], bins=30, alpha=0.7, density=True)
-    else:
-        axes[6].text(0.5, 0.5, "No data", ha="center", va="center", transform=axes[6].transAxes)
-    axes[6].axvline(0, color="red", linestyle="--", alpha=0.7)
-    axes[6].set_xlabel("Residuals")
-    axes[6].set_ylabel("Density")
-    axes[6].set_title("Residual Distribution")
-    axes[6].grid(True, alpha=0.3)
-
-    # 8. Actual vs Predicted
-    if len(analysis_df) > 0:
-        axes[7].scatter(analysis_df["actual"], analysis_df["predicted"], alpha=0.6)
-        lo = analysis_df[["actual", "predicted"]].min().min()
-        hi = analysis_df[["actual", "predicted"]].max().max()
-        axes[7].plot([lo, hi], [lo, hi], "r--", alpha=0.7)
-    else:
-        axes[7].text(0.5, 0.5, "No data", ha="center", va="center", transform=axes[7].transAxes)
-    axes[7].set_xlabel("Actual Log Price")
-    axes[7].set_ylabel("Predicted Log Price")
-    axes[7].set_title("Actual vs Predicted")
-    axes[7].grid(True, alpha=0.3)
-
-    # 9. Boxplot residuals by socket count (if present)
-    if "total_sockets" in analysis_df.columns and analysis_df["total_sockets"].notna().any():
-        vals, labels = [], []
-        for s in sorted(analysis_df["total_sockets"].dropna().unique()):
-            mask = analysis_df["total_sockets"] == s
-            if mask.sum() >= 5:
-                vals.append(analysis_df.loc[mask, "residual"].values)
-                labels.append(f"{int(s)} sockets")
-        if vals:
-            axes[8].boxplot(vals, labels=labels)
-            axes[8].set_ylabel("Residuals")
-            axes[8].set_title("Residuals by Socket Count")
-            axes[8].grid(True, alpha=0.3)
-            axes[8].tick_params(axis="x", rotation=45)
-        else:
-            axes[8].text(0.5, 0.5, "Not enough per-socket groups", ha="center", va="center",
-                         transform=axes[8].transAxes)
-    else:
-        axes[8].text(0.5, 0.5, "No total_sockets feature", ha="center", va="center",
-                     transform=axes[8].transAxes)
-
-    plt.tight_layout()
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
     plt.show()
 
 
@@ -488,10 +590,11 @@ def run_huber(
     Simplest one-call flow (Pipeline):
       - CV (Huber, scaled)
       - Train/Test split with diagnostics
-      - 2×2 and 3×3 plots (optional)
+      - Focused residual panels
     """
     _check_X_is_prepared(X, where="[runner]")
-    print("=== Cross-Validation (Huber robust linear) ===")
+    model_name = "Huber MLR"
+    print(f"=== Cross-Validation ({model_name}) ===")
     cv_scores = cross_val_r2_huber(
         X, y, n_splits=cv_splits, random_state=random_state,
         epsilon=epsilon, alpha=alpha, max_iter=max_iter, tol=tol, verbose=True
@@ -502,21 +605,21 @@ def run_huber(
         X, y,
         test_size=test_size, random_state=random_state,
         epsilon=epsilon, alpha=alpha, max_iter=max_iter, tol=tol,
-        verbose=True, plots=plots
+        verbose=True, plots=plots, model_name=model_name
     )
 
     # print coefficients
     print("\nTop coefficients (by |value|):")
     print(result["coefficients"].head(30).to_string(index=False))
 
-    # richer analysis DataFrame + 3×3 plots
+    # richer analysis DataFrame + focused panels
     analysis_df = analyze_linear_performance(
         result["model"], result["X_test"], result["y_test"],
         X_train=result["X_train"], y_train=result["y_train"],
-        metadata=metadata,
+        metadata=metadata, model_name=model_name,
     )
     if plots:
-        plot_residual_patterns(analysis_df)
+        plot_residual_patterns(analysis_df, model_name=model_name)
 
     result["cv_scores"] = cv_scores
     result["analysis_df"] = analysis_df
@@ -596,11 +699,12 @@ def run_huber_ridge(
         print(coef_df.head(25).to_string(index=False))
 
     if plots:
-        plot_basic_residuals(y_tr, y_tr_hat, y_te, y_te_hat)
+        plot_basic_residuals(y_tr, y_tr_hat, y_te, y_te_hat, model_name="Huber Ridge")
 
-    analysis_df = analyze_linear_performance(best, X_te, y_te, X_train=X_tr, y_train=y_tr, metadata=metadata)
+    analysis_df = analyze_linear_performance(best, X_te, y_te, X_train=X_tr, y_train=y_tr,
+                                             metadata=metadata, model_name="Huber Ridge")
     if plots:
-        plot_residual_patterns(analysis_df)
+        plot_residual_patterns(analysis_df, model_name="Huber Ridge")
 
     return {
         "name": "HuberRidge",
@@ -633,9 +737,7 @@ def run_huber_elasticnet(
     plots: bool = True,
     verbose: bool = True,
 ) -> Dict[str, Any]:
-    """
-    Grid search ElasticNet with Huber loss via SGDRegressor in a Pipeline(scaler+sgd).
-    """
+    """Grid search ElasticNet with Huber loss via SGDRegressor in a Pipeline(scaler+sgd)."""
     _check_X_is_prepared(X, where="[enet grid]")
 
     y_vec = _ensure_vector(y)
@@ -701,11 +803,12 @@ def run_huber_elasticnet(
         print(coef_df.head(25).to_string(index=False))
 
     if plots:
-        plot_basic_residuals(y_tr, y_tr_hat, y_te, y_te_hat)
+        plot_basic_residuals(y_tr, y_tr_hat, y_te, y_te_hat, model_name="Huber ElasticNet")
 
-    analysis_df = analyze_linear_performance(best, X_te, y_te, X_train=X_tr, y_train=y_tr, metadata=metadata)
+    analysis_df = analyze_linear_performance(best, X_te, y_te, X_train=X_tr, y_train=y_tr,
+                                             metadata=metadata, model_name="Huber ElasticNet")
     if plots:
-        plot_residual_patterns(analysis_df)
+        plot_residual_patterns(analysis_df, model_name="Huber ElasticNet")
 
     return {
         "name": "HuberElasticNet",
@@ -951,9 +1054,11 @@ def run_xgb_shap(
             print(f"[warn] SHAP plotting skipped: {e}")
 
     # Keep analysis/plots consistent with the linear flows
-    analysis_df = analyze_linear_performance(best, X_te, y_te, X_train=X_tr, y_train=y_tr, metadata=metadata)
+    model_name = "XGBoost"
+    analysis_df = analyze_linear_performance(best, X_te, y_te, X_train=X_tr, y_train=y_tr,
+                                             metadata=metadata, model_name=model_name)
     if plots:
-        plot_residual_patterns(analysis_df)
+        plot_residual_patterns(analysis_df, model_name=model_name)
 
     return {
         "name": "XGB_SHAP_Grid",
@@ -975,7 +1080,7 @@ def run_xgb_shap(
 
 def decompose_item_with_shap(
     model, explainer, x_row: pd.Series
-) -> pd.DataFrame:
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Return a tidy table for a SINGLE item with:
       - phi (log-space contribution)
@@ -995,7 +1100,7 @@ def decompose_item_with_shap(
         "phi_log": phi,
         "lift_mult_(1+P)": np.exp(phi),
         "lift_pct_(1+P)": np.exp(phi) - 1.0,
-    }).sort_values("phi_log", descending=False, key=lambda s: -s)  # ensures descending by phi_log
+    }).sort_values("phi_log", ascending=False)
 
     pred_log = float(model.predict(x)[0])
     pred_price = float(np.expm1(pred_log))
@@ -1026,4 +1131,5 @@ def decompose_item_with_shap(
 #     # out = run_huber(X, y_df["log_price"], metadata=meta, cv_splits=5, test_size=0.2)
 #     # out = run_huber_ridge(X, y_df["log_price"], metadata=meta)
 #     # out = run_huber_elasticnet(X, y_df["log_price"], metadata=meta)
+#     # xgb_out = run_xgb_shap(X, y_df["log_price"], metadata=meta)
 #     # cmp = compare_regularized_models(X, y_df["log_price"], metadata=meta)
