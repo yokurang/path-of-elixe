@@ -33,7 +33,7 @@ if not _root.handlers:
     _root.setLevel(logging.INFO)
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
     ch = logging.StreamHandler()
-    ch.setFormatter(fmt)
+    ch.setFormat`11``ter(fmt)
     _root.addHandler(ch)
     try:
         OUTPUT_LOG.parent.mkdir(parents=True, exist_ok=True)

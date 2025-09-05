@@ -44,7 +44,7 @@ from src.recorder.poe_currency_recorder import Quote, FXCache  # noqa: F401
 MAX_RESULTS = 100
 DEFAULT_TIMEOUT = 30
 DEFAULT_MAX_RETRIES = 5
-POLITE_PAUSE = 1.0 # short sleep between requests to be nice to API
+POLITE_PAUSE = 1.5 # short sleep between requests to be nice to API
 
 HEADERS = {
     "Accept": "*/*",
