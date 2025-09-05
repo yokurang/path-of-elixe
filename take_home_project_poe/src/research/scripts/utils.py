@@ -4,6 +4,44 @@ from typing import Dict, Any, Optional, Tuple
 import os
 import pandas as pd
 import numpy as np
+from datetime import datetime
+import logging
+
+def setup_logging(level: str = "INFO") -> str:
+    """
+    Initialize logging to console + logs/log_<YYYY-MM-DD-HH-MM>.txt.
+    Returns the path to the log file.
+    """
+    os.makedirs("logs", exist_ok=True)
+    log_path = datetime.now().strftime("logs/log_%Y-%m-%d-%H-%M.txt")
+
+    # If logging already configured, don't reconfigure; just add a file handler.
+    root = logging.getLogger()
+    has_handlers = bool(root.handlers)
+
+    lvl = getattr(logging, level.upper(), logging.INFO)
+    if not has_handlers:
+        logging.basicConfig(
+            level=lvl,
+            format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+            datefmt="%H:%M:%S",
+            handlers=[
+                logging.StreamHandler(),
+                logging.FileHandler(log_path, encoding="utf-8")
+            ],
+        )
+    else:
+        # Ensure our file handler exists
+        fh = logging.FileHandler(log_path, encoding="utf-8")
+        fh.setLevel(lvl)
+        fmt = logging.Formatter(
+            "%(asctime)s | %(levelname)s | %(name)s | %(message)s", "%H:%M:%S")
+        fh.setFormatter(fmt)
+        root.addHandler(fh)
+        root.setLevel(lvl)
+
+    logging.info("Logging initialized; file=%s", log_path)
+    return log_path
 
 # -----------------------------------------------------------------------------
 # Path Resolution
@@ -524,3 +562,56 @@ def report_dataset(
     """Deprecated: Use summarize_feature_set instead."""
     print("Warning: report_dataset is deprecated, use summarize_feature_set instead")
     return summarize_feature_set(X, y, meta, **kwargs)
+
+def combine_parquet_files(file_paths: list[str | Path], output_file: str | Path) -> None:
+    """
+    Combine multiple Parquet files into one DataFrame and save it as a Parquet file.
+    
+    Args:
+        file_paths: List of file paths to Parquet files
+        output_file: Output file path where the combined Parquet file will be saved
+    """
+    # Resolve paths using find_project_root
+    project_root = find_project_root()
+
+    # Load the Parquet files into DataFrames
+    dataframes = []
+    for file_path in file_paths:
+        # Resolve file path using find_project_root logic
+        path = Path(file_path).expanduser()
+        if not path.is_absolute():
+            root = project_root  # Base path is the project root
+            path = (root / path).resolve()
+        
+        # Handle directory input (find single parquet file)
+        if path.is_dir():
+            parquet_files = list(path.glob("*.parquet"))
+            if len(parquet_files) != 1:
+                raise FileNotFoundError(
+                    f"Directory {path} must contain exactly one .parquet file "
+                    f"(found {len(parquet_files)})"
+                )
+            path = parquet_files[0]
+        
+        if not path.exists():
+            raise FileNotFoundError(f"File not found: {path}")
+        
+        # Print resolved path for debugging
+        print(f"Loading file: {path}")
+        
+        # Load the Parquet file
+        df = load_parquet_robust(path)
+        dataframes.append(df)
+    
+    # Concatenate the DataFrames
+    combined_df = pd.concat(dataframes, ignore_index=True)
+    
+    # Ensure the output directory exists
+    output_path = Path(output_file).expanduser().resolve()
+    output_directory = output_path.parent
+    if not output_directory.exists():
+        os.makedirs(output_directory, exist_ok=True)
+    
+    # Save the combined DataFrame to the specified file
+    combined_df.to_parquet(output_path, engine="pyarrow")
+    print(f"Combined DataFrame saved to: {output_path}")

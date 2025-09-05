@@ -11,7 +11,7 @@ import json
 import pandas as pd
 import numpy as np
 
-from utils import find_project_root
+from .utils import find_project_root
 
 # -----------------------------------------------------------------------------
 # Regex & constants
@@ -467,7 +467,7 @@ def make_item_features(
         f.update(parse_requirements(row))
         f.update(parse_weapon_properties(row))
         f.update(parse_mod_attributes(row))
-        f.update(parse_boolean_flags(row))  # <-- add one-hot flags
+        f.update(parse_boolean_flags(row))
 
         if custom_hooks:
             for hook in custom_hooks:
@@ -511,19 +511,40 @@ def make_item_features(
     targets["price"] = pd.to_numeric(df.get("price_amount_in_base", 0), errors="coerce").fillna(0.0)
     targets["log_price"] = np.log1p(targets["price"].clip(lower=0.0))
 
-    # Metadata
+    # Metadata - THIS IS WHERE NAME MAPPING SHOULD GO
     metadata = pd.DataFrame(index=df.index)
     for col in ["id", "league", "indexed", "rarity", "category", "base_type", "type_line", "name"]:
         if col in df.columns:
             metadata[col] = df[col].astype(str)
 
+    # Add unique item name mapping to metadata, not features
+    base_type_to_name = {
+        'Attuned Wand': 'Lifesprig',
+        'Bone Wand': 'Sanguine Diviner',
+        'Acrid Wand': 'Cursecarver',
+        'Volatile Wand': "Enezun's Charge",
+        'Withered Wand': 'The Wicked Quill'
+    }
+    
+    # Create unique_name column in metadata
+    if 'base_type' in df.columns:
+        metadata['unique_name'] = df['base_type'].apply(
+            lambda x: base_type_to_name.get(x, x if x != '' else 'Unknown')
+        )
+    else:
+        metadata['unique_name'] = 'Unknown'
+
+    # Clean features DataFrame (should only contain numeric data)
     features.replace([np.inf, -np.inf], np.nan, inplace=True)
     features.fillna(0.0, inplace=True)
 
+    # Drop any columns that might have slipped in
     totals_to_drop = ["dps", "edps", "calc_edps", "calc_total_dps", "total_dps", "pdps_aug"]
     features.drop(columns=[c for c in totals_to_drop if c in features.columns], inplace=True, errors="ignore")
 
-    var = features.var()
+    # Only compute variance on numeric columns
+    numeric_features = features.select_dtypes(include=[np.number])
+    var = numeric_features.var()
     zero_var = var[var <= 1e-12].index
     if len(zero_var) > 0:
         features.drop(columns=list(zero_var), inplace=True, errors="ignore")
@@ -532,6 +553,7 @@ def make_item_features(
         features = augment_features(features)
 
     return features, targets, metadata
+
 
 # -----------------------------------------------------------------------------
 # Validation
@@ -653,6 +675,39 @@ def create_unique_item_buckets(
             )
     return out
 
+def create_unique_item_buckets_by_name(
+    features: pd.DataFrame,
+    targets: pd.DataFrame,
+    metadata: pd.DataFrame,
+) -> Dict[str, Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]]:
+    """
+    Create buckets for unique items grouped by their unique name.
+    Uses the 'unique_name' column from metadata for grouping.
+    """
+    out: Dict[str, Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]] = {}
+    
+    if "rarity" not in metadata.columns or "unique_name" not in metadata.columns:
+        return out
+
+    rarity = metadata["rarity"].astype(str).str.lower()
+    unique_name = metadata["unique_name"].astype(str)
+
+    # Only process unique items
+    mask_unique = rarity.eq("unique")
+    
+    for name in sorted(unique_name[mask_unique].dropna().unique()):
+        if name == 'Unknown':
+            continue  # Skip unknown items
+            
+        sel = mask_unique & (unique_name == name)
+        if sel.any():
+            out[name] = (
+                features.loc[sel].copy(),
+                targets.loc[sel].copy(),
+                metadata.loc[sel].copy(),
+            )
+    return out
+
 # -----------------------------------------------------------------------------
 # Simple one-call interface
 # -----------------------------------------------------------------------------
@@ -662,6 +717,7 @@ def prepare_feature_sets_from_raw(
     base_path: Optional[str | Path] = None,
     custom_hooks: Optional[List[Callable[[pd.Series, Dict[str, float]], None]]] = None,
     augment: bool = True,
+    group_uniques_by_name: bool = False,
 ) -> Dict[str, Any]:
     """
     Returns:
@@ -671,6 +727,7 @@ def prepare_feature_sets_from_raw(
             "unique_all": (uniq_X, uniq_y, uniq_meta),
             "craft_by_category": {cat: (Xc, yc, mc), ...},
             "unique_by_item": {"unique_<type_line>": (Xu, yu, mu), ...},
+            "unique_by_name": {name: (Xu, yu, mu), ...},  # New option
         }
     """
     df = load_raw_table(file_path, base_path=base_path)
@@ -680,15 +737,66 @@ def prepare_feature_sets_from_raw(
 
     craft_buckets = create_craftable_category_buckets(craft_X, craft_y, craft_meta)
     unique_buckets = create_unique_item_buckets(uniq_X, uniq_y, uniq_meta)
-
-    return {
+    
+    result = {
         "all": (X, y, meta),
         "craft_all": (craft_X, craft_y, craft_meta),
         "unique_all": (uniq_X, uniq_y, uniq_meta),
         "craft_by_category": craft_buckets,
         "unique_by_item": unique_buckets,
     }
+    
+    # Add unique grouping by name if requested
+    if group_uniques_by_name:
+        unique_by_name = create_unique_item_buckets_by_name(uniq_X, uniq_y, uniq_meta)
+        result["unique_by_name"] = unique_by_name
+    
+    return result
 
+def prepare_unique_item_features_by_name(df: pd.DataFrame) -> Dict[str, Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]]:
+    """
+    Alternative approach: Group by unique names BEFORE feature engineering.
+    This ensures each unique item type gets its own feature set.
+    """
+    # First create the name mapping
+    base_type_to_name = {
+        'Attuned Wand': 'Lifesprig',
+        'Bone Wand': 'Sanguine Diviner',
+        'Acrid Wand': 'Cursecarver',
+        'Volatile Wand': "Enezun's Charge",
+        'Withered Wand': 'The Wicked Quill'
+    }
+    
+    # Add unique_name column for grouping
+    if 'base_type' in df.columns:
+        df['unique_name'] = df['base_type'].apply(
+            lambda x: base_type_to_name.get(x, x if x != '' else 'Unknown')
+        )
+    else:
+        df['unique_name'] = 'Unknown'
+    
+    # Filter to only unique rarity items
+    if 'rarity' in df.columns:
+        unique_df = df[df['rarity'].str.lower() == 'unique'].copy()
+    else:
+        unique_df = df.copy()
+    
+    # Group by unique_name and create feature sets for each
+    unique_item_buckets = {}
+    
+    for name, group_df in unique_df.groupby('unique_name'):
+        if name == 'Unknown':
+            continue
+            
+        try:
+            # Create features for this specific unique item
+            features, targets, metadata = make_item_features(group_df, augment=True)
+            unique_item_buckets[name] = (features, targets, metadata)
+        except Exception as e:
+            print(f"Warning: Failed to create features for {name}: {e}")
+            continue
+    
+    return unique_item_buckets
 # -----------------------------------------------------------------------------
 # Example
 # -----------------------------------------------------------------------------

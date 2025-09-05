@@ -1,0 +1,32 @@
+{
+  "query": {
+    "status": {
+      "option": "securable"
+    },
+    "stats": [
+      {
+        "type": "and",
+        "filters": [
+          
+        ],
+        "disabled": false
+      }
+    ],
+    "filters": {
+      "type_filters": {
+        "filters": {
+          "rarity": {
+            "option": "rare"
+          },
+          "category": {
+            "option": "weapon.wand"
+          }
+        },
+        "disabled": false
+      }
+    }
+  },
+  "sort": {
+    "price": "asc"
+  }
+}

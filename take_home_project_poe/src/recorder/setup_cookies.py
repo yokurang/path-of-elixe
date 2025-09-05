@@ -4,7 +4,6 @@ POE Cookie Setup (simple)
 
 - Prompts for POESESSID (required) and cf_clearance (optional)
 - Saves to poe_cookies_config.json
-- Uses setup_logging from main.py
 """
 
 from __future__ import annotations
@@ -15,7 +14,7 @@ import logging
 from datetime import datetime
 from pathlib import Path
 
-from main import setup_logging
+from src.research.scripts.utils import setup_logging
 
 OUT_FILE = "poe_cookies_config.json"
 
