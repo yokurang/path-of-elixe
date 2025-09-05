@@ -202,7 +202,7 @@ def _payload_pair(base_short: str, quote_short: str) -> Dict[str, Any]:
     return {
         "query": {
             "status": {
-                "option": "any"
+                "option": "securable"
             },
             "have": [quote_short],
             "want": [base_short]

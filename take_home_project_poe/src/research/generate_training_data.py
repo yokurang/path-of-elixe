@@ -24,8 +24,8 @@ OUTPUT_LOG = Path("output_generate_training_data.log")
 
 LEAGUE = "Standard"
 # LEAGUE = "Rise%20of%20the%20Abyssal"
-BASE_CURRENCY = "Exalted Orb"     # assignment requires Exalted Orb as base
-PER_COMBO_DEFAULT = 5000            # ≤50 rows saved per combo (recorder returns up to 100 per search)
+BASE_CURRENCY = "Exalted Orb"  # assignment requires Exalted Orb as base
+PER_COMBO_DEFAULT = 200       # target unique rows/ids per combo; ~100 per page
 
 # Root logger + file handler
 _root = logging.getLogger()
@@ -33,7 +33,7 @@ if not _root.handlers:
     _root.setLevel(logging.INFO)
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
     ch = logging.StreamHandler()
-    ch.setFormat`11``ter(fmt)
+    ch.setFormatter(fmt)
     _root.addHandler(ch)
     try:
         OUTPUT_LOG.parent.mkdir(parents=True, exist_ok=True)
@@ -56,15 +56,20 @@ def _paged_collect(
     league: str,
     realm: Optional[str],
     recorder_log_level: str,
-    category_key: str,
+    category_key: str,              # namespaced key for per-category de-dupe
     seen_by_category: Dict[str, Set[str]],
     per_combo: int,
-    page_step: Optional[int] = None,
+    page_step: Optional[int] = 100, # how far to bump offset per loop (≈ API page size)
     max_pages: Optional[int] = None,
 ) -> pd.DataFrame:
     """
-    Walks paginated search by bumping 'offset' until we harvest up to `per_combo`
-    previously unseen ids for the given category_key (or no more results).
+    Walk paginated results by bumping `offset` until we hit one of:
+      • processed `per_combo` unique ids for this combo, OR
+      • collected `per_combo` new-to-category rows, OR
+      • no progress (same page / no new ids), OR
+      • empty page / missing 'id' column / max_pages.
+
+    De-dupe across combos is enforced via `seen_by_category[category_key]`.
     """
     collected_parts: List[pd.DataFrame] = []
     seen = seen_by_category.setdefault(category_key, set())
@@ -72,6 +77,8 @@ def _paged_collect(
     offset = 0
     pages = 0
     total_new = 0
+    processed_ids: Set[str] = set()           # unique ids we've *processed* this combo
+    last_ids_set: Optional[Set[str]] = None   # to detect identical pages (stall guard)
 
     while True:
         if max_pages is not None and pages >= max_pages:
@@ -103,39 +110,72 @@ def _paged_collect(
             log.warning("No 'id' column in page at offset=%d; stopping.", offset)
             break
 
-        ids = df_page["id"].astype(str)
-        new_mask = ~ids.isin(seen)
+        # Page id set (unique within the page)
+        ids_series = df_page["id"].astype(str)
+        ids_set = set(ids_series.unique())
+
+        # 🔒 Stall guard #1: identical page content as last time
+        if last_ids_set is not None and ids_set == last_ids_set:
+            log.info("Same page repeated at offset=%d — stopping.", offset)
+            break
+        last_ids_set = ids_set
+
+        # Track per-combo processed ids (unique)
+        before_proc = len(processed_ids)
+        processed_ids.update(ids_set)
+        added_proc = len(processed_ids) - before_proc
+
+        # Keep only rows NEW to this category (cross-combo de-dup)
+        new_mask = ~ids_series.isin(seen)
         df_new = df_page.loc[new_mask].copy()
 
-        need = per_combo - total_new
-        if need <= 0:
+        # 🔒 Stall guard #2: no progress (no new processed ids AND no new rows to collect)
+        if added_proc == 0 and df_new.empty:
+            log.info("No new ids to process or collect at offset=%d — stopping.", offset)
             break
-        if len(df_new) > need:
-            df_new = df_new.head(need)
 
-        for iid in df_new["id"].astype(str):
-            seen.add(iid)
+        # Cap what we *collect* to what's still needed
+        need_collect = per_combo - total_new
+        if need_collect <= 0:
+            df_new = df_new.iloc[0:0]
+        elif len(df_new) > need_collect:
+            df_new = df_new.head(need_collect)
 
-        collected_parts.append(df_new)
-        total_new += len(df_new)
+        # Update category-level seen set with the rows we're actually keeping
+        if not df_new.empty:
+            for iid in df_new["id"].astype(str):
+                seen.add(iid)
+            collected_parts.append(df_new)
+            total_new += len(df_new)
 
-        # 🚀 New progress log
-        pct = (total_new / per_combo) * 100
+        # Progress log
+        pct_collect = (total_new / per_combo) * 100
+        pct_proc = (len(processed_ids) / per_combo) * 100
         log.info(
-            "Progress [cat=%s | offset=%d | page=%d]: %d/%d collected (%.1f%%)",
-            category_key, offset, pages, total_new, per_combo, pct
+            "Progress [cat=%s | offset=%d | page=%d]: collected %d/%d (%.1f%%), processed %d/%d (%.1f%%)",
+            category_key, offset, pages, total_new, per_combo, pct_collect, len(processed_ids), per_combo, pct_proc
         )
 
+        # Stop when we've processed enough unique ids or collected enough new rows
+        if len(processed_ids) >= per_combo:
+            log.info("Processed target per_combo=%d unique ids; stopping.", per_combo)
+            break
         if total_new >= per_combo:
-            log.info("Collected target per_combo=%d; stopping.", per_combo)
+            log.info("Collected target per_combo=%d new rows; stopping.", per_combo)
             break
 
-        offset += page_step if page_step is not None else len(df_page)
+        # Optional end-of-results guard: if we got a short page (typ. < API page size), likely no more
+        if page_step is not None and len(df_page) < page_step:
+            log.info("Got a short page (%d < %d) — likely end of results. Stopping.", len(df_page), page_step)
+            break
+
+        # Advance offset for next loop
+        step = page_step if page_step is not None else len(df_page)
+        offset += step
 
     if collected_parts:
         return pd.concat(collected_parts, ignore_index=True)
     return pd.DataFrame()
-
 
 # =============================================================================
 # Small helpers
@@ -186,6 +226,33 @@ def _save_parquet(df: pd.DataFrame, path: Path) -> None:
     log.info("Saved %d rows -> %s", len(df), path)
 
 
+# ---- De-dupe key + warm-load -------------------------------------------------
+def _seen_key(category_key: str, league: str, realm: Optional[str]) -> str:
+    """Namespace the seen set by market and category to avoid cross-market collisions."""
+    return f"{_league_fs(league)}|{(realm or '').strip()}|{category_key}"
+
+
+def _warm_seen_from_overall(
+    seen_by_category: Dict[str, Set[str]],
+    *,
+    seen_key: str,
+    category_key: str,
+    league: str,
+) -> None:
+    """Pre-populate seen set from existing overall parquet (if present)."""
+    overall_name = make_overall_filename(category_key=category_key, league=league)
+    overall_path = OVERALL_DIR / overall_name
+    if not overall_path.exists():
+        return
+    try:
+        df = pd.read_parquet(overall_path, columns=["id"])
+        ids = df["id"].astype(str).tolist()
+        seen_by_category.setdefault(seen_key, set()).update(ids)
+        log.info("Warm-loaded %d seen ids from %s", len(ids), overall_path)
+    except Exception as e:
+        log.warning("Failed to warm-load overall parquet %s: %s", overall_path, e)
+
+
 # =============================================================================
 # Naming helpers (deterministic, round-trippable without regex)
 # =============================================================================
@@ -202,8 +269,8 @@ def _league_fs(league: str) -> str:
 def make_combo_filename(
     *,
     category_key: str,
-    rarity: Optional[str],         # None -> "any"
-    corrupted: Optional[bool],     # None -> "any"
+    rarity: Optional[str],
+    corrupted: Optional[bool],
     league: str,
 ) -> str:
     cat = _cat_to_fs(category_key)
@@ -285,17 +352,21 @@ def generate_training_data(
         log.info("========== CATEGORY %d/%d: %s ==========", cidx, total_categories, cat_key)
         per_cat_parts: List[pd.DataFrame] = []
 
+        # Build a namespaced seen key & warm-load from existing overall parquet
+        seen_key = _seen_key(cat_key, league, realm)
+        _warm_seen_from_overall(seen_by_category, seen_key=seen_key, category_key=cat_key, league=league)
+
         # ---------------- PASS 1: category × rarity ----------------
         for ridx, rar_key in enumerate(ITEM_RARITIES.keys(), start=1):
             gidx += 1
             combo_title = f"cat={cat_key} | rarity={rar_key} | corrupted=any | league={league} | base={base_currency}"
             log.info("[global %d/%d][cat %d/%d][pass1 %d/%d] START %s",
-                    gidx, global_total, cidx, total_categories, ridx, per_cat_pass1, combo_title)
+                     gidx, global_total, cidx, total_categories, ridx, per_cat_pass1, combo_title)
 
             base_payload = build_basic_payload(
                 category_key=cat_key,
                 rarity_key=rar_key,
-                status_option="any",
+                status_option="securable",
                 sort_key="price",
                 sort_dir="asc",
             )
@@ -306,11 +377,11 @@ def generate_training_data(
                 league=league,
                 realm=realm,
                 recorder_log_level=recorder_log_level,
-                category_key=cat_key,
+                category_key=seen_key,          # namespaced dedupe key
                 seen_by_category=seen_by_category,
                 per_combo=per_combo,
-                page_step=None,        # recorder's MAX_RESULTS per page; or set None to use len(page)
-                max_pages=None,       # or put a safety cap like 2000
+                page_step=100,                  # keep offset aligned with API pages
+                max_pages=None,
             )
 
             combo_name = make_combo_filename(category_key=cat_key, rarity=rar_key, corrupted=None, league=league)
@@ -335,12 +406,12 @@ def generate_training_data(
             corr_label = "corrupted" if is_corr else "not_corrupted"
             combo_title = f"cat={cat_key} | rarity=any | corrupted={corr_label} | league={league} | base={base_currency}"
             log.info("[global %d/%d][cat %d/%d][pass2 %d/%d] START %s",
-                    gidx, global_total, cidx, total_categories, p2idx, per_cat_pass2, combo_title)
+                     gidx, global_total, cidx, total_categories, p2idx, per_cat_pass2, combo_title)
 
             base_payload = build_basic_payload(
                 category_key=cat_key,
                 rarity_key=None,
-                status_option="any",
+                status_option="securable",
                 sort_key="price",
                 sort_dir="asc",
             )
@@ -352,10 +423,10 @@ def generate_training_data(
                 league=league,
                 realm=realm,
                 recorder_log_level=recorder_log_level,
-                category_key=cat_key,
+                category_key=seen_key,          # namespaced dedupe key
                 seen_by_category=seen_by_category,
                 per_combo=per_combo,
-                page_step=None,        # or None
+                page_step=100,
                 max_pages=None,
             )
 
@@ -412,7 +483,6 @@ def generate_training_data(
 def main() -> None:
     """
     Run a full Standard-league training snapshot in Exalted Orbs.
-    (Recorder uses MAX_RESULTS=100 per search; we save ≤50 unique per combo.)
     """
     try:
         generate_training_data(

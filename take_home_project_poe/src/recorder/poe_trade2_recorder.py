@@ -31,10 +31,6 @@ from src.recorder.constants import (
     ITEM_RARITIES,
 )
 
-# how many ids to pull per search page (server decides actual page size; this is a cap we pass along)
-PAGE_TARGET = 100            # keep small; server typically returns ~100
-MAX_ID_TARGET = 5000        # how many ids you ultimately want per query
-
 # For FX cache compatibility mapping
 from src.recorder.poe_currency_recorder import Quote, FXCache  # noqa: F401
 
@@ -44,7 +40,7 @@ from src.recorder.poe_currency_recorder import Quote, FXCache  # noqa: F401
 MAX_RESULTS = 100
 DEFAULT_TIMEOUT = 30
 DEFAULT_MAX_RETRIES = 5
-POLITE_PAUSE = 1.5 # short sleep between requests to be nice to API
+POLITE_PAUSE = 1.5  # short sleep between requests to be nice to API
 
 HEADERS = {
     "Accept": "*/*",
@@ -75,6 +71,7 @@ log_fetch = logging.getLogger("poe.trade2.fetch")
 for lg in (log_search, log_fetch):
     if not lg.handlers:
         lg.addHandler(logging.NullHandler())
+
 
 def _retry_after_seconds(resp: aiohttp.ClientResponse) -> Optional[float]:
     ra_raw = resp.headers.get("Retry-After")
@@ -128,7 +125,7 @@ def _masked_cookies_for_log(obj: Dict[str, Any]) -> Dict[str, Any]:
 
 def _summarize_payload(payload: Dict[str, Any]) -> str:
     q = payload.get("query", {})
-    status = q.get("status").get("option")
+    status = (q.get("status") or {}).get("option")
     sort = payload.get("sort")
     filters = q.get("filters") or {}
     type_filters = (filters.get("type_filters") or {}).get("filters") or {}
@@ -346,6 +343,7 @@ class Trade2Price:
     amount_in_base: Optional[float]
     currency_in_base: Optional[str]
     rate_to_base: Optional[float]
+
 
 @dataclass(frozen=True)
 class Trade2ListingRecord:
@@ -650,6 +648,7 @@ class Trade2ListingRecord:
             "crucible": J(self.crucible),
         }
 
+
 # ---------------------------
 # Network calls
 # ---------------------------
@@ -667,7 +666,7 @@ async def post_trade2_search(
     consec_429 = 0
     while True:
         attempt += 1
-        log_search.info("[1/3] POST search -> %s (attempt %d) | %s", url, attempt, _summarize_payload(payload))
+        log_search.info("[1/2] POST search -> %s (attempt %d) | %s", url, attempt, _summarize_payload(payload))
         resp = await session.post(url, json=payload, headers=headers, timeout=timeout)
         async with resp:
             rate_rem = resp.headers.get("X-RateLimit-Remaining")
@@ -724,7 +723,7 @@ async def fetch_listings_one_by_one(
 
     out: List[Trade2ListingRecord] = []
     total = len(ids)
-    log_fetch.info("[2/3] Fetching %d listings by id (one-by-one)", total)
+    log_fetch.info("[2/2] Fetching %d listings by id (one-by-one)", total)
 
     for idx, iid in enumerate(ids, start=1):
         url = TRADE2_FETCH_URL.format(ids=iid, search_id=str(search_id))
@@ -741,12 +740,12 @@ async def fetch_listings_one_by_one(
                         ra = _retry_after_seconds(resp)
                         if ra is not None:
                             log_fetch.info("[id=%s] HTTP %s; Retry-After=%.2fs (attempt %d/%d)",
-                                            iid, resp.status, ra, attempt, max_retries)
+                                           iid, resp.status, ra, attempt, max_retries)
                             await asyncio.sleep(ra)
                         else:
                             delay = _expo_backoff(attempt)
                             log_fetch.info("[id=%s] HTTP %s; backoff=%.2fs (attempt %d/%d)",
-                                            iid, resp.status, delay, attempt, max_retries)
+                                           iid, resp.status, delay, attempt, max_retries)
                             await asyncio.sleep(delay)
                             if polite_pause:
                                 await asyncio.sleep(polite_pause)
@@ -777,7 +776,7 @@ async def fetch_listings_one_by_one(
                 log_fetch.info("[id=%s] Parse error: %s", iid, e)
             break
 
-    log_fetch.info("[3/3] Fetch complete: parsed=%d / requested=%d", len(out), total)
+    log_fetch.info("Fetch complete: parsed=%d / requested=%d", len(out), total)
     return out
 
 
@@ -798,13 +797,21 @@ async def _search_async(
     max_retries: int = DEFAULT_MAX_RETRIES,
     polite_pause: float = POLITE_PAUSE,
 ) -> List[Trade2ListingRecord]:
+    """
+    SINGLE-PAGE search:
+      - Respects caller-provided `payload["offset"]` (defaults to 0 if missing).
+      - Does not loop or paginate internally.
+      - Caps to MAX_RESULTS if set > 0.
+    """
     # 0) Resolve league/realm
     if not (league and realm):
         cfg_league, cfg_realm = load_league_realm(CONFIG_PATH)
         league = league or cfg_league
         realm = realm or cfg_realm
-    log_search.info("Search start: realm=%s, league=%s, base_currency=%s, MAX_RESULTS=%d",
-                    realm, league, base_currency, MAX_RESULTS)
+    log_search.info(
+        "Search start (single page): realm=%s, league=%s, base_currency=%s, MAX_RESULTS=%d",
+        realm, league, base_currency, MAX_RESULTS
+    )
 
     # 1) Load FX cache + converter
     fx = load_fx_cache_or_raise(CURRENCY_CACHE_PATH)
@@ -815,96 +822,67 @@ async def _search_async(
     headers = headers_with_cookies(HEADERS, cookies)
     headers["Referer"] = _build_referer(realm=realm, league=league)
 
-    # 3) Session (cookie jar helps with CF)
+    # 3) Session
     jar = aiohttp.CookieJar(unsafe=True)
     if cookies:
         jar.update_cookies(cookies)
 
-    # 4) POST search
-    # 4) POST search with pagination over `offset`
+    # 4) Single POST search (respect existing offset; default to 0)
     url = _build_search_url(realm=realm, league=league)
     total_timeout = aiohttp.ClientTimeout(total=timeout)
-    ids_accum: List[str] = []
-    search_id: Optional[str] = None
-    offset = 0
-    pages = 0
+    payload = dict(payload or {})
+    payload.setdefault("offset", 0)
 
     async with aiohttp.ClientSession(timeout=total_timeout, cookie_jar=jar) as session:
-        while True:
-            # ensure payload has an offset and (optionally) a per-page cap
-            payload["offset"] = offset
-            # (some APIs accept a "limit"—if Trade2 ignores it, it's fine to omit)
-            # payload["limit"] = PAGE_TARGET
+        data = await post_trade2_search(
+            session,
+            url=url,
+            payload=payload,
+            headers=headers,
+            timeout=timeout,
+            max_retries=max_retries,
+            polite_pause=polite_pause,
+        )
 
-            data = await post_trade2_search(
-                session,
-                url=url,
-                payload=payload,
-                headers=headers,
-                timeout=timeout,
-                max_retries=max_retries,
-                polite_pause=polite_pause,
-            )
-            pages += 1
+        if not isinstance(data, dict):
+            return []
+        if "error" in data:
+            msg = (data.get("error") or {}).get("message", "unknown error")
+            raise RuntimeError(f"trade2 search error: {msg}")
 
-            if not isinstance(data, dict):
-                break
-            if "error" in data:
-                msg = (data.get("error") or {}).get("message", "unknown error")
-                raise RuntimeError(f"trade2 search error: {msg}")
+        search_id = data.get("id") or ""
+        ids_page = list(data.get("result") or [])
+        total_matches = data.get("total")
+        complexity = data.get("complexity")
 
-            # first page establishes the search id (if present)
-            if search_id is None:
-                search_id = data.get("id") or ""
+        log_search.info(
+            "Search page: offset=%d, got=%d, total=%s, complexity=%s",
+            payload.get("offset", 0), len(ids_page), total_matches, complexity
+        )
 
-            ids_page = list(data.get("result") or [])
-            total_matches = data.get("total")
-            complexity = data.get("complexity")
-            log_search.info(
-                "Search page %d: offset=%d, got=%d, total=%s, complexity=%s",
-                pages, offset, len(ids_page), total_matches, complexity
-            )
-
-            if not ids_page:
-                break
-
-            # accumulate unique ids (guard against dupes across pages)
-            before = len(ids_accum)
-            seen = set(ids_accum)
-            ids_accum.extend(i for i in ids_page if i not in seen)
-            added = len(ids_accum) - before
-
-            # advance offset by the size of the raw page returned (not the unique count)
-            offset += len(ids_page)
-
-            # stop once we reach our target
-            if MAX_ID_TARGET > 0 and len(ids_accum) >= MAX_ID_TARGET:
-                ids_accum = ids_accum[:MAX_ID_TARGET]
-                break
-
-            # optional: stop if server reports we've hit total
-            if isinstance(total_matches, int) and offset >= total_matches:
-                break
-
-        if not ids_accum:
+        if not ids_page:
             return []
 
-        # 5) fetch listing details for the accumulated ids
-        #    (you can also batch 10-20 at a time if you add a bulk fetch endpoint later)
+        # Cap to MAX_RESULTS if configured
+        if MAX_RESULTS and MAX_RESULTS > 0 and len(ids_page) > MAX_RESULTS:
+            log_search.info("Limiting processed IDs from %d to %d (MAX_RESULTS)", len(ids_page), MAX_RESULTS)
+            ids_page = ids_page[:MAX_RESULTS]
+
+        # 5) Fetch listing details for this page
         records = await fetch_listings_one_by_one(
             session,
-            search_id=search_id or "",
-            ids=ids_accum,
+            search_id=search_id,
+            ids=ids_page,
             headers=headers,
             timeout=timeout,
             max_retries=max_retries,
             polite_pause=polite_pause,
             converter=converter,
         )
-        failures = len(ids_accum) - len(records)
+        failures = len(ids_page) - len(records)
         log_search.info(
-            "Search finished: pages=%d, success=%d, failed=%d, requested=%d",
-            pages, len(records), failures, len(ids_accum)
+            "Single-page fetch finished: success=%d, failed=%d, requested=%d",
+            len(records), failures, len(ids_page)
         )
         return records
 
@@ -923,19 +901,13 @@ def search_to_dataframe(
     # If payload is None, these help build a basic one:
     category_key: Optional[str] = None,
     rarity_key: Optional[str] = None,
-    status_option: str = "any",
+    status_option: str = "securable", # instant-buyouts
     sort_key: str = "price",
     sort_dir: str = "asc",
 ) -> pd.DataFrame:
     """
-    Run a Trade2 search and return a DataFrame of listings with prices converted to `base_currency`.
-
-    - If `payload` is provided, it is used as-is.
-    - If `payload` is None, a minimal payload is auto-built via
-      `build_basic_payload(category_key, rarity_key, status_option, sort_key, sort_dir)`.
-
-    Only `league` and `realm` are read from config (if you don't pass them).
-    Raises ValueError if FX rates are unavailable.
+    Run a Trade2 search (single page) and return a DataFrame of listings
+    with prices converted to `base_currency`.
     """
     setup_logging(log_level)
 
@@ -981,7 +953,7 @@ def build_basic_payload(
     rarity_key: Optional[str] = None,
     status_option: str = "securable",  # "online" or "any", or "securable" for instant buyouts
     sort_key: str = "price",
-    sort_dir: str = "asc", # "asc"/"desc"
+    sort_dir: str = "asc",  # "asc"/"desc"
 ) -> Dict[str, Any]:
     """
     Construct a minimal Trade2 payload focused on category/rarity.
@@ -1013,7 +985,7 @@ def build_basic_payload(
             "filters": filters,
         },
         "sort": {sort_key: sort_dir},
-        "offset": 0,
+        "offset": 0,  # caller can override this per page
     }
     return payload
 
@@ -1022,17 +994,15 @@ def build_basic_payload(
 # __main__ demo
 # ---------------------------
 if __name__ == "__main__":
-    # Example: scrape ANY Weapon, convert to Divine Orb prices,
+    # Example: scrape ANY Weapon (single page at offset 0), convert to Divine Orb prices,
     # using league/realm from config.yaml and cookies from poe_cookies_config.json.
     setup_logging("INFO")
     try:
-        # Pass None to exercise the auto-builder,
-        # or set `payload=...` to use your own.
         df = search_to_dataframe(
             payload=None,                 # use auto-built payload below
             category_key="weapon",        # ignored if payload is provided
             rarity_key=None,
-            status_option="any",
+            status_option="securable",
             base_currency="Divine Orb",
             league=None,                  # read from config.yaml
             realm=None,                   # read from config.yaml
