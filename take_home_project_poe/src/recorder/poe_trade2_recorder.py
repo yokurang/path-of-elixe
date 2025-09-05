@@ -3,7 +3,7 @@ import json
 import logging
 import pickle
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -30,6 +30,10 @@ from src.recorder.constants import (
     ITEM_TYPES,
     ITEM_RARITIES,
 )
+
+# how many ids to pull per search page (server decides actual page size; this is a cap we pass along)
+PAGE_TARGET = 100            # keep small; server typically returns ~100
+MAX_ID_TARGET = 5000        # how many ids you ultimately want per query
 
 # For FX cache compatibility mapping
 from src.recorder.poe_currency_recorder import Quote, FXCache  # noqa: F401
@@ -343,10 +347,9 @@ class Trade2Price:
     currency_in_base: Optional[str]
     rate_to_base: Optional[float]
 
-
 @dataclass(frozen=True)
 class Trade2ListingRecord:
-    # Listing / identity
+    # Listing / identity (keep these required)
     id: str
     league: Optional[str]
     realm: Optional[str]
@@ -355,49 +358,78 @@ class Trade2ListingRecord:
     price: Trade2Price
     fee: Optional[int]
 
-    # Item meta
-    verified: Optional[bool]
-    rarity: Optional[str]
-    base_type: Optional[str]
-    type_line: Optional[str]
-    name: Optional[str]
-    ilvl: Optional[int]
-    identified: Optional[bool]
-    corrupted: bool
-    duplicated: bool
-    unmodifiable: bool
-    category: Optional[str]  # derived from properties[0].name
+    # Core item meta (make Optionals default to None, bools default False)
+    verified: Optional[bool] = None
+    rarity: Optional[str] = None
+    base_type: Optional[str] = None
+    type_line: Optional[str] = None
+    name: Optional[str] = None
+    ilvl: Optional[int] = None                 # coalesced later
+    identified: Optional[bool] = None
+    corrupted: bool = False
+    duplicated: bool = False
+    unmodifiable: bool = False
+    category: Optional[str] = None
+    frame_type: Optional[int] = None
 
-    # Stack info
-    stack_size: Optional[int]
-    max_stack_size: Optional[int]
+    # influence flags + bag
+    elder: bool = False
+    shaper: bool = False
+    searing: bool = False
+    tangled: bool = False
+    influences: Dict[str, Any] = field(default_factory=dict)
 
-    # Gem-related extras
-    support: Optional[bool]
-    gem_sockets: List[str]
-    weapon_requirements: List[Dict[str, Any]]
-    gem_tabs: List[Dict[str, Any]]
-    gem_background: Optional[str]
-    gem_skill: Optional[str]
-    sec_descr_text: Optional[str]
-    flavour_text: List[str]
-    descr_text: Optional[str]
+    # Stack / misc
+    stack_size: Optional[int] = None
+    max_stack_size: Optional[int] = None
+    support: Optional[bool] = None
+
+    # PoE2 gems / skills
+    gem_sockets: List[str] = field(default_factory=list)
+    gem_tabs: List[Dict[str, Any]] = field(default_factory=list)
+    gem_background: Optional[str] = None
+    gem_skill: Optional[str] = None
+
+    # Text blocks
+    sec_descr_text: Optional[str] = None
+    descr_text: Optional[str] = None
+    flavour_text: List[str] = field(default_factory=list)
+    flavour_text_note: Optional[str] = None
+    prophecy_text: Optional[str] = None
 
     # Raw blocks
-    sockets: List[Dict[str, Any]]
-    properties: List[Dict[str, Any]]
-    requirements: List[Dict[str, Any]]
-    granted_skills: List[Dict[str, Any]]
-    socketed_items: List[Dict[str, Any]]
-    extended: Dict[str, Any]
+    sockets: List[Dict[str, Any]] = field(default_factory=list)
+    socketed_items: List[Dict[str, Any]] = field(default_factory=list)
+    properties: List[Dict[str, Any]] = field(default_factory=list)
+    notable_properties: List[Dict[str, Any]] = field(default_factory=list)
+    requirements: List[Dict[str, Any]] = field(default_factory=list)
+    weapon_requirements: List[Dict[str, Any]] = field(default_factory=list)
+    support_gem_requirements: List[Dict[str, Any]] = field(default_factory=list)
+    additional_properties: List[Dict[str, Any]] = field(default_factory=list)
+    next_level_requirements: List[Dict[str, Any]] = field(default_factory=list)
+    granted_skills: List[Dict[str, Any]] = field(default_factory=list)
+    extended: Dict[str, Any] = field(default_factory=dict)
 
-    # Mods & flags
-    rune_mods: List[str]
-    desecrated_mods: List[str]
-    implicit_mods: List[str]
-    explicit_mods: List[str]
-    veiled_mods: List[str]
-    desecrated: bool
+    # Mod arrays
+    implicit_mods: List[str] = field(default_factory=list)
+    explicit_mods: List[str] = field(default_factory=list)
+    crafted_mods: List[str] = field(default_factory=list)
+    fractured_mods: List[str] = field(default_factory=list)
+    crucible_mods: List[str] = field(default_factory=list)
+    cosmetic_mods: List[str] = field(default_factory=list)
+    veiled_mods: List[str] = field(default_factory=list)
+    rune_mods: List[str] = field(default_factory=list)
+    desecrated_mods: List[str] = field(default_factory=list)
+    desecrated: bool = False
+
+    # Extras (kept for completeness)
+    utility_mods: List[str] = field(default_factory=list)
+    enchant_mods: List[str] = field(default_factory=list)
+    ultimatum_mods: List[Dict[str, Any]] = field(default_factory=list)
+    logbook_mods: List[Dict[str, Any]] = field(default_factory=list)
+    scourge_mods: List[str] = field(default_factory=list)
+    scourged: Dict[str, Any] = field(default_factory=dict)
+    crucible: Dict[str, Any] = field(default_factory=dict)
 
     @staticmethod
     def _category_from_properties(props: List[Dict[str, Any]]) -> Optional[str]:
@@ -410,7 +442,20 @@ class Trade2ListingRecord:
         return (s[1:-1] if s.startswith('[') and s.endswith(']') else s) if s else None
 
     @staticmethod
-    def _price(listing_price: Dict[str, Any], converter: Optional[PriceConverter]) -> "Trade2Price":
+    def _coalesce_ilvl(item: Dict[str, Any]) -> Optional[int]:
+        """Prefer `ilvl`; fall back to `itemLevel` (string or int)."""
+        v = item.get("ilvl", None)
+        if v is None:
+            v = item.get("itemLevel", None)
+        if v is None:
+            return None
+        try:
+            return int(str(v))
+        except Exception:
+            return None
+
+    @staticmethod
+    def _price(listing_price: Dict[str, Any], converter: Optional["PriceConverter"]) -> "Trade2Price":
         amt = listing_price.get("amount")
         cur_raw = listing_price.get("currency")
         typ = listing_price.get("type")
@@ -443,20 +488,21 @@ class Trade2ListingRecord:
         )
 
     @classmethod
-    def from_api(cls, listing: Dict[str, Any], converter: Optional[PriceConverter]) -> "Trade2ListingRecord":
+    def from_api(cls, listing: Dict[str, Any], converter: Optional["PriceConverter"]) -> "Trade2ListingRecord":
         item = listing.get("item") or {}
         lst = listing.get("listing") or {}
         acc = (lst.get("account") or {})
+        props: List[Dict[str, Any]] = item.get("properties") or []
 
         price_obj = cls._price(lst.get("price") or {}, converter)
-        props: List[Dict[str, Any]] = item.get("properties") or []
-        # simple category extraction: first property name
-        cat = None
-        if props:
-            n = (props[0] or {}).get("name")
-            if n:
-                s = str(n)
-                cat = s[1:-1] if s.startswith('[') and s.endswith(']') else s
+        cat = cls._category_from_properties(props)
+
+        infl = item.get("influences") or {}
+        frame_type = item.get("frameType")
+        elder = bool(item.get("elder", False))
+        shaper = bool(item.get("shaper", False))
+        searing = bool(item.get("searing", False))
+        tangled = bool(item.get("tangled", False))
 
         return cls(
             id=listing.get("id"),
@@ -466,43 +512,72 @@ class Trade2ListingRecord:
             seller=acc.get("name"),
             price=price_obj,
             fee=lst.get("fee"),
+
             verified=item.get("verified"),
             rarity=item.get("rarity"),
             base_type=item.get("baseType"),
             type_line=item.get("typeLine"),
             name=item.get("name"),
-            ilvl=item.get("ilvl"),
+            ilvl=cls._coalesce_ilvl(item),
             identified=item.get("identified"),
             corrupted=bool(item.get("corrupted", False)),
             duplicated=bool(item.get("duplicated", False)),
             unmodifiable=bool(item.get("unmodifiable", False)),
             category=cat,
+            frame_type=frame_type,
+
+            elder=elder, shaper=shaper, searing=searing, tangled=tangled,
+            influences=infl,
+
             stack_size=item.get("stackSize"),
             max_stack_size=item.get("maxStackSize"),
             support=item.get("support"),
+
             gem_sockets=item.get("gemSockets") or [],
-            weapon_requirements=item.get("weaponRequirements") or [],
             gem_tabs=item.get("gemTabs") or [],
             gem_background=item.get("gemBackground"),
             gem_skill=item.get("gemSkill"),
+
             sec_descr_text=item.get("secDescrText"),
-            flavour_text=item.get("flavourText") or [],
             descr_text=item.get("descrText"),
+            flavour_text=item.get("flavourText") or [],
+            flavour_text_note=item.get("flavourTextNote"),
+            prophecy_text=item.get("prophecyText"),
+
             sockets=item.get("sockets") or [],
-            properties=props,
-            requirements=item.get("requirements") or [],
-            granted_skills=item.get("grantedSkills") or [],
             socketed_items=item.get("socketedItems") or [],
+            properties=props,
+            notable_properties=item.get("notableProperties") or [],
+            requirements=item.get("requirements") or [],
+            weapon_requirements=item.get("weaponRequirements") or [],
+            support_gem_requirements=item.get("supportGemRequirements") or [],
+            additional_properties=item.get("additionalProperties") or [],
+            next_level_requirements=item.get("nextLevelRequirements") or [],
+            granted_skills=item.get("grantedSkills") or [],
             extended=item.get("extended") or {},
-            rune_mods=item.get("runeMods") or [],
-            desecrated_mods=item.get("desecratedMods") or [],
+
             implicit_mods=item.get("implicitMods") or [],
             explicit_mods=item.get("explicitMods") or [],
+            crafted_mods=item.get("craftedMods") or [],
+            fractured_mods=item.get("fracturedMods") or [],
+            crucible_mods=item.get("crucibleMods") or [],
+            cosmetic_mods=item.get("cosmeticMods") or [],
             veiled_mods=item.get("veiledMods") or [],
+            rune_mods=item.get("runeMods") or [],
+            desecrated_mods=item.get("desecratedMods") or [],
             desecrated=bool(item.get("desecrated", False)),
+
+            utility_mods=item.get("utilityMods") or [],
+            enchant_mods=item.get("enchantMods") or [],
+            ultimatum_mods=item.get("ultimatumMods") or [],
+            logbook_mods=item.get("logbookMods") or [],
+            scourge_mods=item.get("scourgeMods") or [],
+            scourged=item.get("scourged") or {},
+            crucible=item.get("crucible") or {},
         )
 
     def to_row(self) -> Dict[str, Any]:
+        J = lambda x: json.dumps(x, ensure_ascii=False)
         return {
             "id": self.id,
             "league": self.league,
@@ -527,31 +602,53 @@ class Trade2ListingRecord:
             "duplicated": self.duplicated,
             "unmodifiable": self.unmodifiable,
             "category": self.category,
+            "frame_type": self.frame_type,
+            "elder": self.elder,
+            "shaper": self.shaper,
+            "searing": self.searing,
+            "tangled": self.tangled,
+            "influences": J(self.influences),
             "stack_size": self.stack_size,
             "max_stack_size": self.max_stack_size,
             "support": self.support,
-            "gem_sockets": json.dumps(self.gem_sockets, ensure_ascii=False),
-            "weapon_requirements": json.dumps(self.weapon_requirements, ensure_ascii=False),
-            "gem_tabs": json.dumps(self.gem_tabs, ensure_ascii=False),
+            "gem_sockets": J(self.gem_sockets),
+            "gem_tabs": J(self.gem_tabs),
             "gem_background": self.gem_background,
             "gem_skill": self.gem_skill,
             "sec_descr_text": self.sec_descr_text,
-            "flavour_text": json.dumps(self.flavour_text, ensure_ascii=False),
             "descr_text": self.descr_text,
-            "sockets": json.dumps(self.sockets, ensure_ascii=False),
-            "properties": json.dumps(self.properties, ensure_ascii=False),
-            "requirements": json.dumps(self.requirements, ensure_ascii=False),
-            "granted_skills": json.dumps(self.granted_skills, ensure_ascii=False),
-            "socketed_items": json.dumps(self.socketed_items, ensure_ascii=False),
-            "extended": json.dumps(self.extended, ensure_ascii=False),
-            "rune_mods": json.dumps(self.rune_mods, ensure_ascii=False),
-            "desecrated_mods": json.dumps(self.desecrated_mods, ensure_ascii=False),
-            "implicit_mods": json.dumps(self.implicit_mods, ensure_ascii=False),
-            "explicit_mods": json.dumps(self.explicit_mods, ensure_ascii=False),
-            "veiled_mods": json.dumps(self.veiled_mods, ensure_ascii=False),
+            "flavour_text": J(self.flavour_text),
+            "flavour_text_note": self.flavour_text_note,
+            "prophecy_text": self.prophecy_text,
+            "sockets": J(self.sockets),
+            "socketed_items": J(self.socketed_items),
+            "properties": J(self.properties),
+            "notable_properties": J(self.notable_properties),
+            "requirements": J(self.requirements),
+            "weapon_requirements": J(self.weapon_requirements),
+            "support_gem_requirements": J(self.support_gem_requirements),
+            "additional_properties": J(self.additional_properties),
+            "next_level_requirements": J(self.next_level_requirements),
+            "granted_skills": J(self.granted_skills),
+            "extended": J(self.extended),
+            "implicit_mods": J(self.implicit_mods),
+            "explicit_mods": J(self.explicit_mods),
+            "crafted_mods": J(self.crafted_mods),
+            "fractured_mods": J(self.fractured_mods),
+            "crucible_mods": J(self.crucible_mods),
+            "cosmetic_mods": J(self.cosmetic_mods),
+            "veiled_mods": J(self.veiled_mods),
+            "rune_mods": J(self.rune_mods),
+            "desecrated_mods": J(self.desecrated_mods),
             "desecrated": self.desecrated,
+            "utility_mods": J(self.utility_mods),
+            "enchant_mods": J(self.enchant_mods),
+            "ultimatum_mods": J(self.ultimatum_mods),
+            "logbook_mods": J(self.logbook_mods),
+            "scourge_mods": J(self.scourge_mods),
+            "scourged": J(self.scourged),
+            "crucible": J(self.crucible),
         }
-
 
 # ---------------------------
 # Network calls
@@ -724,51 +821,91 @@ async def _search_async(
         jar.update_cookies(cookies)
 
     # 4) POST search
+    # 4) POST search with pagination over `offset`
     url = _build_search_url(realm=realm, league=league)
     total_timeout = aiohttp.ClientTimeout(total=timeout)
+    ids_accum: List[str] = []
+    search_id: Optional[str] = None
+    offset = 0
+    pages = 0
+
     async with aiohttp.ClientSession(timeout=total_timeout, cookie_jar=jar) as session:
-        data = await post_trade2_search(
-            session,
-            url=url,
-            payload=payload,
-            headers=headers,
-            timeout=timeout,
-            max_retries=max_retries,
-            polite_pause=polite_pause,
-        )
+        while True:
+            # ensure payload has an offset and (optionally) a per-page cap
+            payload["offset"] = offset
+            # (some APIs accept a "limit"—if Trade2 ignores it, it's fine to omit)
+            # payload["limit"] = PAGE_TARGET
 
-        if isinstance(data, dict) and "error" in data:
-            msg = (data.get("error") or {}).get("message", "unknown error")
-            raise RuntimeError(f"trade2 search error: {msg}")
+            data = await post_trade2_search(
+                session,
+                url=url,
+                payload=payload,
+                headers=headers,
+                timeout=timeout,
+                max_retries=max_retries,
+                polite_pause=polite_pause,
+            )
+            pages += 1
 
-        search_id = data.get("id") or ""
-        ids_all = list(data.get("result") or [])
-        total_matches = data.get("total")
-        complexity = data.get("complexity")
-        log_search.info("Search OK: search_id=%s, result_ids=%d, total=%s, complexity=%s",
-                        search_id, len(ids_all), total_matches, complexity)
+            if not isinstance(data, dict):
+                break
+            if "error" in data:
+                msg = (data.get("error") or {}).get("message", "unknown error")
+                raise RuntimeError(f"trade2 search error: {msg}")
 
-        if not ids_all:
+            # first page establishes the search id (if present)
+            if search_id is None:
+                search_id = data.get("id") or ""
+
+            ids_page = list(data.get("result") or [])
+            total_matches = data.get("total")
+            complexity = data.get("complexity")
+            log_search.info(
+                "Search page %d: offset=%d, got=%d, total=%s, complexity=%s",
+                pages, offset, len(ids_page), total_matches, complexity
+            )
+
+            if not ids_page:
+                break
+
+            # accumulate unique ids (guard against dupes across pages)
+            before = len(ids_accum)
+            seen = set(ids_accum)
+            ids_accum.extend(i for i in ids_page if i not in seen)
+            added = len(ids_accum) - before
+
+            # advance offset by the size of the raw page returned (not the unique count)
+            offset += len(ids_page)
+
+            # stop once we reach our target
+            if MAX_ID_TARGET > 0 and len(ids_accum) >= MAX_ID_TARGET:
+                ids_accum = ids_accum[:MAX_ID_TARGET]
+                break
+
+            # optional: stop if server reports we've hit total
+            if isinstance(total_matches, int) and offset >= total_matches:
+                break
+
+        if not ids_accum:
             return []
 
-        # 5) Cap by MAX_RESULTS
-        ids = ids_all[:MAX_RESULTS] if MAX_RESULTS > 0 else ids_all
-        if len(ids) < len(ids_all):
-            log_search.info("Limiting processed IDs from %d to %d (MAX_RESULTS)", len(ids_all), len(ids))
-
-        # 6) Fetch listings
+        # 5) fetch listing details for the accumulated ids
+        #    (you can also batch 10-20 at a time if you add a bulk fetch endpoint later)
         records = await fetch_listings_one_by_one(
             session,
-            search_id=search_id,
-            ids=ids,
+            search_id=search_id or "",
+            ids=ids_accum,
             headers=headers,
             timeout=timeout,
             max_retries=max_retries,
             polite_pause=polite_pause,
             converter=converter,
         )
-        failures = len(ids) - len(records)
-        log_search.info("Search finished: success=%d, failed=%d, requested=%d", len(records), failures, len(ids))
+        failures = len(ids_accum) - len(records)
+        log_search.info(
+            "Search finished: pages=%d, success=%d, failed=%d, requested=%d",
+            pages, len(records), failures, len(ids_accum)
+        )
         return records
 
 
@@ -842,7 +979,7 @@ def build_basic_payload(
     *,
     category_key: Optional[str] = None,
     rarity_key: Optional[str] = None,
-    status_option: str = "any",  # "online" or "any", or "securable" for instant buyouts
+    status_option: str = "securable",  # "online" or "any", or "securable" for instant buyouts
     sort_key: str = "price",
     sort_dir: str = "asc", # "asc"/"desc"
 ) -> Dict[str, Any]:

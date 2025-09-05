@@ -25,7 +25,7 @@ OUTPUT_LOG = Path("output_generate_training_data.log")
 LEAGUE = "Standard"
 # LEAGUE = "Rise%20of%20the%20Abyssal"
 BASE_CURRENCY = "Exalted Orb"     # assignment requires Exalted Orb as base
-PER_COMBO_DEFAULT = 25000            # ≤50 rows saved per combo (recorder returns up to 100 per search)
+PER_COMBO_DEFAULT = 5000            # ≤50 rows saved per combo (recorder returns up to 100 per search)
 
 # Root logger + file handler
 _root = logging.getLogger()
@@ -45,6 +45,96 @@ if not _root.handlers:
         pass
 
 log = logging.getLogger("poe.training.collector")
+
+# =============================================================================
+# Pagination helper
+# =============================================================================
+def _paged_collect(
+    *,
+    base_payload: Dict[str, Any],
+    base_currency: str,
+    league: str,
+    realm: Optional[str],
+    recorder_log_level: str,
+    category_key: str,
+    seen_by_category: Dict[str, Set[str]],
+    per_combo: int,
+    page_step: Optional[int] = None,
+    max_pages: Optional[int] = None,
+) -> pd.DataFrame:
+    """
+    Walks paginated search by bumping 'offset' until we harvest up to `per_combo`
+    previously unseen ids for the given category_key (or no more results).
+    """
+    collected_parts: List[pd.DataFrame] = []
+    seen = seen_by_category.setdefault(category_key, set())
+
+    offset = 0
+    pages = 0
+    total_new = 0
+
+    while True:
+        if max_pages is not None and pages >= max_pages:
+            log.info("Reached max_pages=%d at offset=%d", max_pages, offset)
+            break
+
+        payload = dict(base_payload)
+        payload["offset"] = offset
+
+        try:
+            df_page = search_to_dataframe(
+                payload=payload,
+                base_currency=base_currency,
+                league=league,
+                realm=realm,
+                save_csv=None,
+                log_level=recorder_log_level,
+            )
+        except Exception as e:
+            log.warning("Page fetch failed at offset=%d: %s", offset, e)
+            break
+
+        pages += 1
+
+        if df_page is None or df_page.empty:
+            log.info("Empty page at offset=%d — stopping.", offset)
+            break
+        if "id" not in df_page.columns:
+            log.warning("No 'id' column in page at offset=%d; stopping.", offset)
+            break
+
+        ids = df_page["id"].astype(str)
+        new_mask = ~ids.isin(seen)
+        df_new = df_page.loc[new_mask].copy()
+
+        need = per_combo - total_new
+        if need <= 0:
+            break
+        if len(df_new) > need:
+            df_new = df_new.head(need)
+
+        for iid in df_new["id"].astype(str):
+            seen.add(iid)
+
+        collected_parts.append(df_new)
+        total_new += len(df_new)
+
+        # 🚀 New progress log
+        pct = (total_new / per_combo) * 100
+        log.info(
+            "Progress [cat=%s | offset=%d | page=%d]: %d/%d collected (%.1f%%)",
+            category_key, offset, pages, total_new, per_combo, pct
+        )
+
+        if total_new >= per_combo:
+            log.info("Collected target per_combo=%d; stopping.", per_combo)
+            break
+
+        offset += page_step if page_step is not None else len(df_page)
+
+    if collected_parts:
+        return pd.concat(collected_parts, ignore_index=True)
+    return pd.DataFrame()
 
 
 # =============================================================================
@@ -195,45 +285,34 @@ def generate_training_data(
         log.info("========== CATEGORY %d/%d: %s ==========", cidx, total_categories, cat_key)
         per_cat_parts: List[pd.DataFrame] = []
 
-        # ---------------- PASS 1: category × rarity (progressive save) ----------------
+        # ---------------- PASS 1: category × rarity ----------------
         for ridx, rar_key in enumerate(ITEM_RARITIES.keys(), start=1):
             gidx += 1
             combo_title = f"cat={cat_key} | rarity={rar_key} | corrupted=any | league={league} | base={base_currency}"
             log.info("[global %d/%d][cat %d/%d][pass1 %d/%d] START %s",
-                     gidx, global_total, cidx, total_categories, ridx, per_cat_pass1, combo_title)
+                    gidx, global_total, cidx, total_categories, ridx, per_cat_pass1, combo_title)
 
-            payload = build_basic_payload(
+            base_payload = build_basic_payload(
                 category_key=cat_key,
                 rarity_key=rar_key,
                 status_option="any",
                 sort_key="price",
                 sort_dir="asc",
             )
-            payload["offset"] = 0
-            try:
-                df_all = search_to_dataframe(
-                    payload=payload,
-                    base_currency=base_currency,
-                    league=league,
-                    realm=realm,
-                    save_csv=None,
-                    log_level=recorder_log_level,
-                )
-            except Exception as e:
-                log.warning("Search failed: %s (%s)", combo_title, e)
-                continue
 
-            # Combo diagnostics
-            seen = seen_by_category.setdefault(cat_key, set())
-            ids = df_all["id"].astype(str) if ("id" in df_all.columns and not df_all.empty) else pd.Series([], dtype=str)
-            new_mask = ~ids.isin(seen)
-            new_available = int(new_mask.sum())
-            dupes = int((~new_mask).sum())
-            take_n = min(per_combo, new_available)
-            log.info("Combo results: total=%d, new_available=%d, duplicates=%d, taking=%d",
-                     len(df_all), new_available, dupes, take_n)
+            df_take = _paged_collect(
+                base_payload=base_payload,
+                base_currency=base_currency,
+                league=league,
+                realm=realm,
+                recorder_log_level=recorder_log_level,
+                category_key=cat_key,
+                seen_by_category=seen_by_category,
+                per_combo=per_combo,
+                page_step=None,        # recorder's MAX_RESULTS per page; or set None to use len(page)
+                max_pages=None,       # or put a safety cap like 2000
+            )
 
-            df_take = _select_unique_for_category(df_all, cat_key, seen_by_category, per_combo)
             combo_name = make_combo_filename(category_key=cat_key, rarity=rar_key, corrupted=None, league=league)
             combo_path = TRAINING_DIR / combo_name
             _save_parquet(df_take, combo_path)
@@ -250,47 +329,36 @@ def generate_training_data(
                     "file": str(combo_path),
                 })
 
-        # ---------------- PASS 2: category × corrupted (progressive save) ----------------
+        # ---------------- PASS 2: category × corrupted ----------------
         for p2idx, is_corr in enumerate((True, False), start=1):
             gidx += 1
             corr_label = "corrupted" if is_corr else "not_corrupted"
             combo_title = f"cat={cat_key} | rarity=any | corrupted={corr_label} | league={league} | base={base_currency}"
             log.info("[global %d/%d][cat %d/%d][pass2 %d/%d] START %s",
-                     gidx, global_total, cidx, total_categories, p2idx, per_cat_pass2, combo_title)
+                    gidx, global_total, cidx, total_categories, p2idx, per_cat_pass2, combo_title)
 
-            payload = build_basic_payload(
+            base_payload = build_basic_payload(
                 category_key=cat_key,
                 rarity_key=None,
                 status_option="any",
                 sort_key="price",
                 sort_dir="asc",
             )
-            _add_corrupted(payload, is_corr)
-            payload["offset"] = 0
-            try:
-                df_all = search_to_dataframe(
-                    payload=payload,
-                    base_currency=base_currency,
-                    league=league,
-                    realm=realm,
-                    save_csv=None,
-                    log_level=recorder_log_level,
-                )
-            except Exception as e:
-                log.warning("Search failed: %s (%s)", combo_title, e)
-                continue
+            _add_corrupted(base_payload, is_corr)
 
-            # Combo diagnostics
-            seen = seen_by_category.setdefault(cat_key, set())
-            ids = df_all["id"].astype(str) if ("id" in df_all.columns and not df_all.empty) else pd.Series([], dtype=str)
-            new_mask = ~ids.isin(seen)
-            new_available = int(new_mask.sum())
-            dupes = int((~new_mask).sum())
-            take_n = min(per_combo, new_available)
-            log.info("Combo results: total=%d, new_available=%d, duplicates=%d, taking=%d",
-                     len(df_all), new_available, dupes, take_n)
+            df_take = _paged_collect(
+                base_payload=base_payload,
+                base_currency=base_currency,
+                league=league,
+                realm=realm,
+                recorder_log_level=recorder_log_level,
+                category_key=cat_key,
+                seen_by_category=seen_by_category,
+                per_combo=per_combo,
+                page_step=None,        # or None
+                max_pages=None,
+            )
 
-            df_take = _select_unique_for_category(df_all, cat_key, seen_by_category, per_combo)
             combo_name = make_combo_filename(category_key=cat_key, rarity=None, corrupted=is_corr, league=league)
             combo_path = TRAINING_DIR / combo_name
             _save_parquet(df_take, combo_path)
