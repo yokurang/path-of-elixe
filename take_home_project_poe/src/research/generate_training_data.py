@@ -25,7 +25,7 @@ OUTPUT_LOG = Path("output_generate_training_data.log")
 LEAGUE = "Standard"
 # LEAGUE = "Rise%20of%20the%20Abyssal"
 BASE_CURRENCY = "Exalted Orb"  # assignment requires Exalted Orb as base
-PER_COMBO_DEFAULT = 200       # target unique rows/ids per combo; ~100 per page
+PER_COMBO_DEFAULT = 3000       # target unique rows/ids per combo; ~100 per page
 
 # Root logger + file handler
 _root = logging.getLogger()
