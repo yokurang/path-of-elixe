@@ -1,6 +1,5 @@
-#!/usr/bin/env python3
 """
-POE Cookie Setup (simple)
+POE Cookie Setup
 
 - Prompts for POESESSID (required) and cf_clearance (optional)
 - Saves to poe_cookies_config.json
@@ -8,7 +7,6 @@ POE Cookie Setup (simple)
 
 from __future__ import annotations
 
-import argparse
 import json
 import logging
 from datetime import datetime
@@ -18,7 +16,9 @@ from src.research.scripts.utils import setup_logging
 
 OUT_FILE = "poe_cookies_config.json"
 
-def save_cookies_to_config(cookies: dict, config_file: str = "poe_config.json") -> None:
+
+def save_cookies_to_config(cookies: dict,
+                           config_file: str = "poe_config.json") -> None:
     cfg = {
         "cookies": cookies,
         "last_updated": datetime.now().isoformat(),

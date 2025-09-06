@@ -1,10 +1,12 @@
-#!/usr/bin/env python3
+"""
+Beautifulsoup scraper to get a list of currencies available from the poe2 website 
+https://www.pathofexile.com/trade2/exchange/poe2/Standard
+"""
+
 import json
 import requests
 
 LEAGUE = "Standard"
-
-# We try the trade2 endpoint first (PoE2). If that ever changes, we fall back to the PoE1 path.
 ENDPOINTS = [
     f"https://www.pathofexile.com/api/trade2/data/static?league={LEAGUE}",
 ]
@@ -16,9 +18,10 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
+# KEEP IT SIMPLE; DON'T COLLECT WHAT SEES TO BE IRRELEVANT(?) CURRENCIES
 EXCLUDE_PREFIXES = ("greater-", "perfect-", 'lesser-'
                    )  # drop Greater/Perfect variants
-EXCLUDE_SUFFIXES = ("shard",)
+EXCLUDE_SUFFIXES = ("shard",)  # don't care about shards
 
 
 def fetch_static_json():
@@ -66,7 +69,7 @@ def main():
     print("SHORT_TO_FULL_CURRENCY_MAP =")
     print(json.dumps(mapping, ensure_ascii=False, indent=2))
 
-    # Optional: write to a file alongside your codebase
+    # note to self: this overwrite existing maps all the time
     with open("short_to_full_currency_map.json", "w", encoding="utf-8") as f:
         json.dump(mapping, f, ensure_ascii=False, indent=2)
 
