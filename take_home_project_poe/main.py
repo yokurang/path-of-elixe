@@ -13,16 +13,17 @@ from src.recorder.poe_trade2_recorder import (
     load_fx_cache_or_raise,
     PriceConverter,
     CURRENCY_CACHE_PATH,
-    stream_search_results,   # <-- async streaming API
+    stream_search_results,
 )
 
 from src.research.scripts.pipeline import ModelArtifact
 from src.research.scripts.features_poex import make_item_features
 
+OUTPUT_DIR = Path("results/undervalued")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# ==========================================================
-# Detection Session
-# ==========================================================
+
+# class to log item predictions metadata
 class DetectionSession:
     """Track all inspected items with predictions, chosen model, undervalued status."""
 
@@ -66,9 +67,7 @@ class DetectionSession:
             self.logger.warning("Session empty, nothing to save.")
 
 
-# ==========================================================
-# POE Arbitrage Detector
-# ==========================================================
+# class that makes price predictions
 class POEArbitrageDetector:
     def __init__(self, base_currency: str = "Exalted Orb", models_path: str = "models/wand"):
         self.base_currency = base_currency
@@ -94,7 +93,6 @@ class POEArbitrageDetector:
             try:
                 with open(model_file, "rb") as f:
                     artifact = pickle.load(f)
-                # Some old runs may have dicts, re-wrap them
                 if isinstance(artifact, dict):
                     artifact = ModelArtifact(**artifact)
                 if not isinstance(artifact, ModelArtifact):
@@ -106,6 +104,7 @@ class POEArbitrageDetector:
         if not self.models:
             raise RuntimeError("No models loaded successfully")
 
+    # heuristic to determine which wand ML model to apply for a given item
     def _determine_model_key(self, row: dict) -> str:
         rarity = str(row.get("rarity", "")).lower()
         name = str(row.get("name", "") or row.get("type_line", ""))
@@ -137,12 +136,29 @@ class POEArbitrageDetector:
             feats_aligned = artifact.transform_input(feats)
             log_pred = artifact.model.predict(feats_aligned)[0]
 
-            # Inverse of log1p since training used np.log1p(price)
-            fair_price_native = float(np.expm1(log_pred))
+            # Predicted price in Exalted Orbs (model’s native scale)
+            numerical_price = float(np.expm1(log_pred))
 
-            # Convert into the chosen base currency
-            fair_price, _ = self.converter.convert(fair_price_native, "Exalted Orb")
-            return key, fair_price
+            try:
+                # Convert into requested base currency
+                fair_price, rate = self.converter.convert(numerical_price, "Exalted Orb")
+                self.logger.info(
+                    f"Prediction | Item={row.get('name','Unknown')}\n"
+                    f"Predicted Log Price={log_pred:.6f},\n"
+                    f"Predicted Fair Price in Exalted Orbs={numerical_price:.6f},\n"
+                    f"Predicted Fair Price in {self.base_currency}={fair_price:.6f},\n"
+                    f"FX Rate=Exalted Orb -> {self.base_currency} ({rate:.6f})\n"
+                )
+                return key, fair_price
+            except Exception as fx_err:
+                self.logger.error(
+                    f"Prediction FX failed | Item={row.get('name','Unknown')}\n"
+                    f"Predicted Log Price={log_pred:.6f}\n"
+                    f"Predicted Fair Price in Exalted Orbs={numerical_price:.6f},\n"
+                    f"Reason={fx_err}\n"
+                )
+                return key, None
+
         except Exception as e:
             self.logger.error(f"Prediction failed for {row.get('name', 'Unknown')}: {e}")
             return key, None
@@ -152,7 +168,6 @@ class POEArbitrageDetector:
         payload: dict,
         discount_threshold: float,
         max_results: int,
-        min_price_threshold: float,
     ) -> tuple[pd.DataFrame, DetectionSession]:
         session = DetectionSession(self.base_currency)
         undervalued_records = []
@@ -166,7 +181,7 @@ class POEArbitrageDetector:
             item_name = row.get("name") or row.get("type_line")
             price_now = row.get("price_amount_in_base")
 
-            if price_now is None or price_now < min_price_threshold:
+            if price_now is None:
                 session.log_item(row, "N/A", None, price_now, None, None, False)
                 continue
 
@@ -183,26 +198,27 @@ class POEArbitrageDetector:
 
             if undervalued:
                 self.logger.info(
-                    f"Undervalued: {item_name} | "
-                    f"Current={price_now:.3f} {self.base_currency} | "
-                    f"Fair={fair_price:.3f} {self.base_currency} | "
-                    f"Discount={discount:.1%} | Profit={profit:.3f}"
+                    f"Undervalued | Item={item_name}\n"
+                    f"Item Price in {self.base_currency}={price_now:.3f},\n"
+                    f"Predicted Fair Price in {self.base_currency}={fair_price:.3f},\n"
+                    f"Discount={discount:.2%},\n"
+                    f"Profit={profit:.3f} {self.base_currency}\n"
                 )
                 undervalued_records.append(session.records[-1])
             else:
                 self.logger.info(
-                    f"Not undervalued: {item_name} | "
-                    f"Current={price_now:.3f}, Fair={fair_price:.3f}, "
-                    f"Discount={discount:.1%}, Profit={profit:.3f}"
+                    f"Not Undervalued | Item={item_name}\n"
+                    f"Item Price in {self.base_currency}={price_now:.3f},\n"
+                    f"Predicted Fair Price in {self.base_currency}={fair_price:.3f},\n"
+                    f"Discount={discount:.2%},\n"
+                    f"Profit={profit:.3f} {self.base_currency}\n"
                 )
 
-        df = pd.DataFrame(undervalued_records).sort_values("potential_profit", ascending=False)
+        df = pd.DataFrame(undervalued_records)
+        if not df.empty and "potential_profit" in df.columns:
+            df = df.sort_values("potential_profit", ascending=False)
         return df, session
 
-
-# ==========================================================
-# CLI Helpers
-# ==========================================================
 def parse_args():
     parser = argparse.ArgumentParser(description="POE Arbitrage Detection")
     payload_group = parser.add_mutually_exclusive_group()
@@ -211,9 +227,7 @@ def parse_args():
 
     parser.add_argument("--discount-threshold", type=float, default=0.25)
     parser.add_argument("--max-results", type=int, default=100)
-    parser.add_argument("--min-price-threshold", type=float, default=0.1)
     parser.add_argument("--base-currency", type=str, default="Exalted Orb")
-    parser.add_argument("--output-prefix", type=str, default="undervalued")
     parser.add_argument("--models-path", type=str, default="models/wand")
     parser.add_argument("--log-level", type=str, choices=["DEBUG", "INFO", "WARNING", "ERROR"], default="INFO")
     return parser.parse_args()
@@ -227,18 +241,15 @@ def load_payload(args) -> dict | None:
             return json.load(f)
     return None
 
-
-# ==========================================================
-# Main entry
-# ==========================================================
 def main():
     args = parse_args()
     log_level = getattr(logging, args.log_level.upper())
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
     logging.basicConfig(
         level=log_level,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        handlers=[logging.StreamHandler(), logging.FileHandler(f"arbitrage_{ts}.log")],
+        handlers=[logging.StreamHandler(), logging.FileHandler(OUTPUT_DIR / f"arbitrage_{ts}.log")],
     )
 
     logger = logging.getLogger("POEArbMain")
@@ -252,20 +263,16 @@ def main():
             payload=payload,
             discount_threshold=args.discount_threshold,
             max_results=args.max_results,
-            min_price_threshold=args.min_price_threshold,
         )
     )
 
     logger.info(f"Undervalued items found: {len(df)}")
 
-    # Save undervalued results
-    out_csv = f"{args.output_prefix}_{ts}.csv"
-    df.to_csv(out_csv, index=False)
-    logger.info(f"Undervalued items saved to: {out_csv}")
-
-    # Save session (all inspected items)
-    out_parquet = f"{args.output_prefix}_session_{ts}.parquet"
-    session.save(out_parquet)
+    out_parquet = OUTPUT_DIR / f"undervalued_{ts}.parquet"
+    df.to_parquet(out_parquet, index=False)
+    logger.info(f"Undervalued items saved to: {out_parquet}")
+    # logs
+    session.save(OUTPUT_DIR / f"session_{ts}.parquet")
 
 
 if __name__ == "__main__":
