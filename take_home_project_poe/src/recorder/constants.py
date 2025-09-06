@@ -7,7 +7,7 @@ from pathlib import Path
 
 POE_BASE_URL = "https://www.pathofexile.com"
 TRADE2_SEARCH_URL = POE_BASE_URL + "/api/trade2/search/{realm}/{league}"
-TRADE2_FETCH_URL = POE_BASE_URL + "/api/trade2/fetch/{ids}?query={search_id}"
+TRADE2_FETCH_URL = POE_BASE_URL + "/api/trade2/fetch/{ids}"
 
 # Reference
 CURRENCY_MAP: Dict[str, str] = {

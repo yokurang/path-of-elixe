@@ -17,6 +17,8 @@ from src.recorder.poe_trade2_recorder import (
 )
 
 from src.research.scripts.pipeline import ModelArtifact
+from src.recorder.poe_currency_recorder import FXCache
+
 from src.research.scripts.features_poex import make_item_features
 
 OUTPUT_DIR = Path("predictions/undervalued")
@@ -149,7 +151,8 @@ class POEArbitrageDetector:
                 fair_price, rate = self.converter.convert(
                     numerical_price, "Exalted Orb")
                 self.logger.info(
-                    f"Prediction | Item={row.get('name','Unknown')}\n"
+                    f"Prediction | Item={row.get('name','Unknown')} "
+                    f"(Rarity={row.get('rarity','Unknown')})\n"
                     f"Predicted Log Price={log_pred:.6f},\n"
                     f"Predicted Fair Price in Exalted Orbs={numerical_price:.6f},\n"
                     f"Predicted Fair Price in {self.base_currency}={fair_price:.6f},\n"
@@ -158,10 +161,12 @@ class POEArbitrageDetector:
                 return key, fair_price
             except Exception as fx_err:
                 self.logger.error(
-                    f"Prediction FX failed | Item={row.get('name','Unknown')}\n"
+                    f"Prediction FX failed | Item={row.get('name','Unknown')} "
+                    f"(Rarity={row.get('rarity','Unknown')})\n"
                     f"Predicted Log Price={log_pred:.6f}\n"
                     f"Predicted Fair Price in Exalted Orbs={numerical_price:.6f},\n"
-                    f"Reason={fx_err}\n")
+                    f"Reason={fx_err}\n"
+                )
                 return key, None
 
         except Exception as e:
@@ -206,20 +211,23 @@ class POEArbitrageDetector:
 
             if undervalued:
                 self.logger.info(
-                    f"Undervalued | Item={item_name}\n"
+                    f"Undervalued | Item={item_name} "
+                    f"(Rarity={row.get('rarity','Unknown')})\n"
                     f"Item Price in {self.base_currency}={price_now:.3f},\n"
                     f"Predicted Fair Price in {self.base_currency}={fair_price:.3f},\n"
                     f"Discount={discount:.2%},\n"
-                    f"Profit={profit:.3f} {self.base_currency}\n")
+                    f"Profit={profit:.3f} {self.base_currency}\n"
+                )
                 undervalued_records.append(session.records[-1])
             else:
                 self.logger.info(
-                    f"Not Undervalued | Item={item_name}\n"
+                    f"Not Undervalued | Item={item_name} "
+                    f"(Rarity={row.get('rarity','Unknown')})\n"
                     f"Item Price in {self.base_currency}={price_now:.3f},\n"
                     f"Predicted Fair Price in {self.base_currency}={fair_price:.3f},\n"
                     f"Discount={discount:.2%},\n"
-                    f"Profit={profit:.3f} {self.base_currency}\n")
-
+                    f"Profit={profit:.3f} {self.base_currency}\n"
+                )
         df = pd.DataFrame(undervalued_records)
         if not df.empty and "potential_profit" in df.columns:
             df = df.sort_values("potential_profit", ascending=False)
