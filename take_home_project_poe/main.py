@@ -246,10 +246,17 @@ def main():
     log_level = getattr(logging, args.log_level.upper())
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
+    (OUTPUT_DIR / "parq").mkdir(parents=True, exist_ok=True)
+    (OUTPUT_DIR / "session").mkdir(parents=True, exist_ok=True)
+    (OUTPUT_DIR / "logs").mkdir(parents=True, exist_ok=True)
+
     logging.basicConfig(
         level=log_level,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        handlers=[logging.StreamHandler(), logging.FileHandler(OUTPUT_DIR / f"arbitrage_{ts}.log")],
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler(OUTPUT_DIR / "logs" / f"arbitrage_{ts}.log")
+        ],
     )
 
     logger = logging.getLogger("POEArbMain")
@@ -268,12 +275,12 @@ def main():
 
     logger.info(f"Undervalued items found: {len(df)}")
 
-    out_parquet = OUTPUT_DIR / f"undervalued_{ts}.parquet"
+    out_parquet = OUTPUT_DIR / "parq" / f"undervalued_{ts}.parquet"
     df.to_parquet(out_parquet, index=False)
     logger.info(f"Undervalued items saved to: {out_parquet}")
-    # logs
-    session.save(OUTPUT_DIR / f"session_{ts}.parquet")
 
+    session_path = OUTPUT_DIR / "session" / f"session_{ts}.parquet"
+    session.save(session_path)
 
 if __name__ == "__main__":
     main()

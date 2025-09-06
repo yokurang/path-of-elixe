@@ -509,7 +509,7 @@ def make_item_features(
     # Targets
     targets = pd.DataFrame(index=df.index)
     targets["price"] = pd.to_numeric(df.get("price_amount_in_base", 0), errors="coerce").fillna(0.0)
-    targets["log_price"] = np.log1p(targets["price"].clip(lower=0.0))
+    targets["log_price"] = np.log1p(targets["price"].clip(lower=0.0)) # we cannot have negative prices
 
     # Metadata - THIS IS WHERE NAME MAPPING SHOULD GO
     metadata = pd.DataFrame(index=df.index)
